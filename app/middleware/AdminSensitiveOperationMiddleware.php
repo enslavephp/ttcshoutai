@@ -29,12 +29,15 @@ class AdminSensitiveOperationMiddleware
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
-            new \app\common\util\SystemClock(),
-            config('jwt') ?: []
+            new SystemClock(),
+            $jwtCfg
         );
-        $this->svc = new AdminSensitiveOperationService();
     }
 
     public function handle($request, Closure $next, string $operationType = 'GENERIC')
@@ -61,7 +64,7 @@ class AdminSensitiveOperationMiddleware
         $token = (string)(Request::header('X-Confirm-Token') ?? Request::param('confirmation_token', ''));
         if ($token === '') {
             // 未提供，则生成一个待确认 token，返回 409
-            $ttl  = (int)(config('security.sensitive_ttl') ?? 300);
+            $ttl  = (int)(\app\common\Helper::getValue('security.sensitive_ttl') ?? 300);
             $opData = [
                 'path' => Request::baseUrl(),
                 'method' => Request::method(),

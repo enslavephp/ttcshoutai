@@ -8,6 +8,7 @@ use think\facade\Request;
 use think\facade\Validate;
 use think\facade\Db;
 use think\facade\Filesystem;
+use think\facade\Log;
 
 use app\admin\model\ShopAdminMerchant;
 use app\admin\validate\ShopAdminMerchantValidate;
@@ -30,10 +31,14 @@ class Merchant extends BaseController
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
     }
 
@@ -186,10 +191,22 @@ class Merchant extends BaseController
                 ]);
 
                 // 3.5 子账号额度 +1
-                Db::name('shopadmin_merchant')
-                    ->where('id', $merchantId)
-                    ->inc('current_sub_accounts', 1)
-                    ->update();
+//                Db::name('shopadmin_merchant')
+//                    ->where('id', $merchantId)
+//                    ->inc('current_sub_accounts', 1)
+//                    ->update();
+//                一次性修正 SQL，把每个商户的 current_sub_accounts 纠正为实际子账号数（不含超管）：
+//                UPDATE shopadmin_merchant m
+//JOIN (
+//    SELECT merchant_id, COUNT(*) AS sub_cnt
+//  FROM shopadmin_user
+//  WHERE is_primary_super_admin = 0
+//  GROUP BY merchant_id
+//) u ON u.merchant_id = m.id
+//SET m.current_sub_accounts = u.sub_cnt;
+
+
+
 
                 $result = [
                     'merchant_id' => $merchantId,
@@ -532,10 +549,8 @@ class Merchant extends BaseController
 
         try {
             $total = (clone $query)->count();
-            $rows  = $query->page($page, $limit)
-                ->order($sortCol, $sortDir)
-                ->select()
-                ->toArray();
+            $rows = $query->order($sortCol, $sortDir)->page($page, $limit)->select()->toArray();
+
 
             $hasMore = ($page * $limit) < $total;
 

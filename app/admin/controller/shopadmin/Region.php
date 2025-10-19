@@ -5,7 +5,6 @@ namespace app\admin\controller\shopadmin;
 
 use app\BaseController;
 use think\facade\Request;
-use think\facade\Db;
 use think\facade\Cache;
 use app\admin\model\GeoRegion;
 

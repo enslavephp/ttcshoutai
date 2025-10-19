@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace app\admin\controller\secure;
 
 use app\BaseController;
+use app\common\util\SystemClock;
 use think\facade\Request;
 use app\common\infra\CacheFacadeAdapter;
 use app\common\service\TokenService;
@@ -21,10 +22,14 @@ class Confirm extends BaseController
     private function tokenSvc(): TokenService
     {
         if ($this->tokenService === null) {
+            // 初始化 TokenService 用于生成和验证 JWT token
+            $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+            $jwtCfg['secret'] = $jwtSecret;
+
             $this->tokenService = new TokenService(
                 new CacheFacadeAdapter(),
-                new \app\common\util\SystemClock(),
-                config('jwt') ?: []
+                new SystemClock(),
+                $jwtCfg
             );
         }
         return $this->tokenService;

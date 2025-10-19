@@ -4,6 +4,8 @@ declare(strict_types=1);
 namespace app\shopadmin\model;
 
 use think\Model;
+use app\shopadmin\model\ShopAdminUserRole;
+use app\shopadmin\model\ShopAdminUser;
 
 /**
  * 角色模型（ORM）
@@ -53,7 +55,7 @@ class ShopAdminRole extends Model
 
     /**
      * 多对多：角色 ⇄ 管理员（通过 shopadmin_user_role）
-     * 说明：中间表包含 merchant_id，withPivot 一并返回以便做租户校验
+     * 注意：ShopAdminUser 已位于 app\shopadmin\model 下
      */
     public function users()
     {
@@ -65,7 +67,7 @@ class ShopAdminRole extends Model
         )->withPivot(['merchant_id','assigned_at','assigned_by','valid_from','valid_to']);
     }
 
-    // ---------- 查询范围（便于控制器复用） ----------
+    // ---------- 查询范围 ----------
 
     /** 限定商户 */
     public function scopeOfMerchant($query, int $merchantId)
@@ -77,7 +79,7 @@ class ShopAdminRole extends Model
     public function scopeKeyword($query, ?string $kw)
     {
         if ($kw !== null && $kw !== '') {
-            $kw = '%' . str_replace(['%','_'], ['\%','\_'], $kw) . '%';
+            $kw = '%' . str_replace(['%','_'], ['\\%','\\_'], $kw) . '%';
             $query->whereLike('code|name|description', $kw);
         }
     }

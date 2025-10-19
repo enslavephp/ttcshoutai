@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace app\shopadmin\controller\rbac;
 
 use app\BaseController;
+
 use think\facade\Request;
 use think\facade\Validate;
 use think\facade\Cache;
@@ -32,10 +33,15 @@ class Permission extends BaseController
 
     public function __construct()
     {
-        $cache = new CacheFacadeAdapter();
-        $clock = new SystemClock();
-        $cfg   = config('jwt') ?: [];
-        $this->tokenService = new TokenService($cache, $clock, $cfg);
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
+        $this->tokenService = new TokenService(
+            new CacheFacadeAdapter(),
+            new SystemClock(),
+            $jwtCfg
+        );
     }
 
     /* ======================= 基础工具 ======================= */
@@ -50,7 +56,7 @@ class Permission extends BaseController
     /** 权限缓存前缀（shopadmin 默认前缀） */
     private function permCachePrefix(): string
     {
-        return (string)(config('permission.prefix') ?? 'shopadmin:perms:');
+        return (string)(\app\common\Helper::getValue('permission.prefix') ?? 'shopadmin:perms:');
     }
 
     /** 失效某管理员的权限缓存 */

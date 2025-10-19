@@ -35,10 +35,15 @@ class Role extends BaseController
     // 构造函数，初始化 TokenService
     public function __construct()
     {
-        $cache = new CacheFacadeAdapter(); // 缓存适配器
-        $clock = new SystemClock(); // 系统时钟
-        $cfg   = config('jwt') ?: []; // 获取配置文件中的 jwt 配置
-        $this->tokenService = new TokenService($cache, $clock, $cfg); // 初始化 TokenService
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
+        $this->tokenService = new TokenService(
+            new CacheFacadeAdapter(),
+            new SystemClock(),
+            $jwtCfg
+        );
     }
 
     /** 文本规范化（去前后空白与全角空格） */
@@ -53,7 +58,7 @@ class Role extends BaseController
     /** 等级排序方向：asc=数字越小权限越高；desc=数字越大权限越高 */
     private function levelOrder(): string
     {
-        $order = (string) (config('permission.level_order') ?? 'asc');
+        $order = (string) (\app\common\Helper::getValue('permission.level_order') ?? 'asc');
         return ($order === 'desc') ? 'desc' : 'asc';
     }
 
@@ -103,7 +108,7 @@ class Role extends BaseController
     {
         if ($adminId <= 0) return false;
         $now   = date('Y-m-d H:i:s');
-        $super = (string)(config('permission.super_admin_code') ?? 'super_admin');
+        $super = (string)(\app\common\Helper::getValue('permission.super_admin_code') ?? 'super_admin');
         return AdminUserRole::alias('ur')
                 ->join(['admin_role'=>'r'],'r.id = ur.role_id')
                 ->where('ur.admin_id', $adminId)
@@ -401,7 +406,7 @@ class Role extends BaseController
         }
 
         $total = (clone $q)->count();
-        $rows  = $q->page($page, $limit)->order('level','asc')->order('id','desc')->select()->toArray();
+        $rows  = $q->page($page, $limit)->order('id','asc')->select()->toArray();
 
         foreach ($rows as &$r) {
             $roleLv = isset($r['level']) ? (int)$r['level'] : ($this->levelOrder()==='desc' ? 0 : 99);
@@ -414,6 +419,20 @@ class Role extends BaseController
             'page'  => $page,
             'limit' => $limit,
         ]);
+    }
+
+    /** 给用户分配角色（存在则更新有效期；越权用“最高等级”判断） */
+    public function AdminUserhasrole()
+    {
+        [$ok, $ctx] = $this->requireAdminAuth(); if (!$ok) return $ctx;
+        $adminId = (int)(Request::post('admin_id') ?? 0);
+
+        if ($adminId<=0) return $this->jsonResponse('缺少 admin_id', 400, 'error');
+        $data = AdminUserRole::alias('ur')
+            ->join(['admin_role'=>'r'],'r.id = ur.role_id')
+            ->where('ur.admin_id', $adminId)
+            ->select()->toArray();
+        return $this->jsonResponse('当前管理员绑定的角色', 200, 'success',$data);
     }
 
     /** 给用户分配角色（存在则更新有效期；越权用“最高等级”判断） */

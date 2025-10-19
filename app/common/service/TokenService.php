@@ -6,6 +6,7 @@ use app\common\contracts\ClockInterface;
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 
+
 class TokenService
 {
     private SimpleCacheInterface $cache;
@@ -183,8 +184,8 @@ class TokenService
         }
 
         // 读取配置 TTL
-        $accessTtl  = (int)(config('jwt.expire')      ?? 3600);
-        $refreshTtl = (int)(config('jwt.refresh_ttl') ?? 7*24*3600);
+        $accessTtl  = (int)(\app\common\Helper::getValue('jwt.expire')      ?? 3600);
+        $refreshTtl = (int)(\app\common\Helper::getValue('jwt.refresh_ttl') ?? 7*24*3600);
 
         return $this->issue($claims, $accessTtl, $refreshTtl);
     }

@@ -13,7 +13,6 @@ use think\facade\Db;
  *  - id, admin_id, role_id
  *  - assigned_at, assigned_by
  *  - valid_from, valid_to
- *  - created_at, updated_at
  *
  * 说明：
  *  - 统一通过 ORM 操作本表，不使用 Db::name('admin_user_role')。
@@ -28,17 +27,13 @@ class AdminUserRole extends Model
     protected $pk   = 'id';
 
     /** 自动时间戳（若表没有 created_at/updated_at，可改成 false） */
-    protected $autoWriteTimestamp = true;
-    protected $createTime = 'created_at';
-    protected $updateTime = 'updated_at';
+    protected $autoWriteTimestamp = false;
     protected $dateFormat = 'Y-m-d H:i:s';
 
     /** 字段白名单（更安全） */
     protected $field = [
         'id','admin_id','role_id',
         'assigned_at','assigned_by',
-        'valid_from','valid_to',
-        'created_at','updated_at',
     ];
 
     /** 类型转换（避免字符串数字引起比较错误） */
@@ -50,8 +45,6 @@ class AdminUserRole extends Model
         'assigned_at' => 'datetime',
         'valid_from'  => 'datetime',
         'valid_to'    => 'datetime',
-        'created_at'  => 'datetime',
-        'updated_at'  => 'datetime',
     ];
 
     /** 查询作用域：按用户ID */

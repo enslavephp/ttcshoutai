@@ -14,10 +14,15 @@ class TokenMiddleware
 
     public function __construct()
     {
-        $cache = new CacheFacadeAdapter();
-        $clock = new SystemClock();
-        $cfg   = config('jwt') ?: [];
-        $this->tokens = new TokenService($cache, $clock, $cfg);
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
+        $this->tokenService = new TokenService(
+            new CacheFacadeAdapter(),
+            new SystemClock(),
+            $jwtCfg
+        );
     }
 
     public function handle($request, \Closure $next)
@@ -38,7 +43,7 @@ class TokenMiddleware
 
         // 1) 取 access token：优先 Authorization，其次 Cookie(at)
         $auth = $request->header('Authorization');
-        $cookieAtName = config('jwt.cookie.name_access', 'at');
+        $cookieAtName = \app\common\Helper::getValue('jwt.cookie.name_access', 'at');
         $cookieAt = Cookie::get($cookieAtName);
 
         $rawToken = null;

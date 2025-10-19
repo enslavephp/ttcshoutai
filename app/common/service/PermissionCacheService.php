@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace app\common\service;
 
+
 use think\facade\Cache;
 use app\admin\model\AdminUserRole;
 use app\admin\model\AdminRole;
@@ -28,33 +29,31 @@ class PermissionCacheService
     /** TTL（秒） */
     private static function ttl(): int
     {
-        return (int) (config('permission.cache_ttl') ?? 600);
+        return (int) (\app\common\Helper::getValue('permission.cache_ttl') ?? 600);
     }
 
     /** 管理员权限缓存 key */
     private static function adminKey(int $adminId): string
     {
-        $prefix = (string) (config('permission.prefix') ?? 'admin:perms:');
+        $prefix = (string)(\app\common\Helper::getValue('permission.prefix') ?? 'admin:perms:');
         return $prefix . $adminId;
     }
 
     /** 角色权限缓存 key */
     private static function roleKey(int $roleId): string
     {
-        $prefix = (string) (config('permission.role_perm_prefix') ?? 'admin:roleperms:');
+        $prefix = (string) (\app\common\Helper::getValue('permission.role_perm_prefix') ?? 'admin:roleperms:');
         return $prefix . $roleId;
     }
+// \app\common\service\PermissionCacheService.php
 
-    /**
-     * 读取：角色 → 权限代码集合（带缓存）
-     * @return string[] 去重且排序后的权限 code 列表
-     */
     public static function getRolePermCodes(int $roleId): array
     {
-        $key = self::roleKey($roleId);
-        $ttl = self::ttl();
+        $key    = self::roleKey($roleId);
+        $ttl    = self::ttl();
+        $strict = (bool)(\app\common\Helper::getValue('permission.strict') ?? false);
 
-        $codes = Cache::remember($key, function() use ($roleId) {
+        $fetch = function() use ($roleId) {
             $list = AdminRolePermission::alias('rp')
                 ->join(['admin_permission' => 'p'], 'p.id = rp.permission_id')
                 ->where('rp.role_id', $roleId)
@@ -66,34 +65,30 @@ class PermissionCacheService
             $list = array_values(array_unique($list));
             sort($list, SORT_STRING);
             return $list;
-        }, $ttl);
+        };
 
+        if ($strict || $ttl <= 0) {
+            return $fetch();
+        }
+
+        $codes = Cache::remember($key, $fetch, $ttl);
         return is_array($codes) ? $codes : [];
     }
 
-    /**
-     * 读取：管理员 → 权限代码集合（带缓存）
-     * 只合并“当前有效”的角色（角色启用、角色有效期命中、分配有效期命中）
-     * @return string[] 去重且排序后的权限 code 列表
-     */
     public static function getAdminPermCodes(int $adminId): array
     {
-        $key = self::adminKey($adminId);
-        $ttl = self::ttl();
+        $key    = self::adminKey($adminId);
+        $ttl    = self::ttl();
+        $strict = (bool)(\app\common\Helper::getValue('permission.strict') ?? false);
 
-        $codes = Cache::remember($key, function() use ($adminId) {
+        $fetch = function() use ($adminId) {
             $now = date('Y-m-d H:i:s');
-
-            // 找到该管理员当前有效的角色ID
             $roleIds = AdminUserRole::alias('ur')
                 ->join(['admin_role' => 'r'], 'r.id = ur.role_id')
                 ->where('ur.admin_id', $adminId)
-                // 角色启停
                 ->where('r.status', 1)
-                // 角色有效期：[from, to)
                 ->where(function($q) use ($now){ $q->whereNull('r.valid_from')->whereOr('r.valid_from','<=',$now); })
                 ->where(function($q) use ($now){ $q->whereNull('r.valid_to')->whereOr('r.valid_to','>',$now); })
-                // 分配有效期：[from, to)
                 ->where(function($q) use ($now){ $q->whereNull('ur.valid_from')->whereOr('ur.valid_from','<=',$now); })
                 ->where(function($q) use ($now){ $q->whereNull('ur.valid_to')->whereOr('ur.valid_to','>',$now); })
                 ->column('ur.role_id');
@@ -101,7 +96,6 @@ class PermissionCacheService
             $roleIds = array_values(array_unique(array_map('intval', $roleIds)));
             if (!$roleIds) return [];
 
-            // 合并所有角色权限（优先复用角色缓存）
             $all = [];
             foreach ($roleIds as $rid) {
                 $all = array_merge($all, self::getRolePermCodes($rid));
@@ -109,10 +103,16 @@ class PermissionCacheService
             $all = array_values(array_unique(array_map('strval', $all)));
             sort($all, SORT_STRING);
             return $all;
-        }, $ttl);
+        };
 
+        if ($strict || $ttl <= 0) {
+            return $fetch();
+        }
+
+        $codes = Cache::remember($key, $fetch, $ttl);
         return is_array($codes) ? $codes : [];
     }
+
 
     /** 失效：某角色的权限集合缓存 */
     public static function invalidateRole(int $roleId): void

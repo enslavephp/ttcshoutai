@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace app\middleware;
 
+//跨域文件处理
 class CorsMiddleware
 {
     public function handle($request, \Closure $next)
@@ -11,6 +12,7 @@ class CorsMiddleware
         // 强烈建议使用白名单治理，而非 '*'
         $allow = [
             'http://localhost:5173',
+            'http://localhost:5174',
             'http://127.0.0.1:5173',
             // 'https://dev.yourdomain.com',
         ];

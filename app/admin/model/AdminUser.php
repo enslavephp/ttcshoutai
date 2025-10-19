@@ -82,16 +82,17 @@ class AdminUser extends Model
         $rows = AdminUserRole::alias('ur')
             ->join(['admin_role'=>'r'],'r.id = ur.role_id')
             ->where('ur.admin_id', (int)$this->getAttr('id'))
-            // 分配有效期
             ->where(function($q) use ($now){ $q->whereNull('ur.valid_from')->whereOr('ur.valid_from','<=',$now); })
             ->where(function($q) use ($now){ $q->whereNull('ur.valid_to')->whereOr('ur.valid_to','>',$now); })
-            // 角色有效期 + 启停
             ->where('r.status',1)
             ->where(function($q) use ($now){ $q->whereNull('r.valid_from')->whereOr('r.valid_from','<=',$now); })
             ->where(function($q) use ($now){ $q->whereNull('r.valid_to')->whereOr('r.valid_to','>',$now); })
+            ->distinct(true)                 // ← 加一个去重更稳
             ->column('r.id');
-        return array_map('intval',$rows);
+
+        return array_values(array_map('intval', $rows));
     }
+
 
     /**
      * 最有权限的等级（最高等级）
@@ -102,15 +103,17 @@ class AdminUser extends Model
     public function bestRoleLevel(): int
     {
         $ids = $this->activeRoleIds();
-        $order = (string)(config('permission.level_order') ?? 'asc');
-        if (!$ids) return $order==='desc' ? 0 : 99;
+        $order = (string) (\app\common\Helper::getValue('permission.level_order') ?? 'asc');
+        if (!$ids) return $order === 'desc' ? 0 : 99;
 
         $levels = AdminRole::whereIn('id',$ids)->column('level');
-        $levels = array_map('intval',$levels);
+        // 只保留正整数等级
+        $levels = array_values(array_filter(array_map('intval', $levels), fn($v) => $v > 0));
 
-        if ($order === 'desc') return (int) max($levels);
-        return (int) min($levels);
+        if (!$levels) return $order === 'desc' ? 0 : 99;
+        return $order === 'desc' ? (int)max($levels) : (int)min($levels);
     }
+
 
     /** 兼容旧方法名（历史代码可能在用） */
     public function minRoleLevel(): int

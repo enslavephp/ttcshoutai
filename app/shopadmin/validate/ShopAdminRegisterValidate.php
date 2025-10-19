@@ -11,7 +11,7 @@ class ShopAdminRegisterValidate extends Validate
         'username' => 'require|alphaDash|min:3|max:64',
         'password' => 'require|min:8|max:128',
         'email'    => 'email|max:254',
-        'phone'    => 'regex:^\\+[1-9]\\d{1,14}$',
+        'phone'    => 'require|regex:^1[3-9]\\d{9}$',
     ];
 
     protected $message = [

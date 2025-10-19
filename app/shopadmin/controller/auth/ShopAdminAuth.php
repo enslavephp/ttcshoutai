@@ -10,6 +10,7 @@ use think\facade\Cache;
 use think\facade\Cookie;
 use think\facade\Log;
 
+
 use app\shopadmin\validate\ShopAdminLoginValidate;
 use app\shopadmin\validate\ShopAdminRegisterValidate;
 use app\shopadmin\validate\ShopAdminChangePasswordValidate;
@@ -26,9 +27,12 @@ use app\shopadmin\model\ShopAdminUserPasswordHistory;
 use app\shopadmin\model\ShopAdminUserLoginAudit;
 use app\shopadmin\service\ShopAdminSensitiveOperationService;
 
-// 如你项目中已有同名模型，保持引用即可
+// 权限相关模型
 use app\shopadmin\model\ShopAdminPermission;
 use app\shopadmin\model\ShopAdminRolePermission;
+
+// ✅ 商户模型改用后台命名空间（ORM）
+use app\admin\model\ShopAdminMerchant;
 
 class ShopAdminAuth extends BaseController
 {
@@ -44,10 +48,14 @@ class ShopAdminAuth extends BaseController
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
     }
 
@@ -69,7 +77,7 @@ class ShopAdminAuth extends BaseController
 
     private function hashPassword(string $plain): array
     {
-        $cost = (int)(config('security.admin_bcrypt_cost') ?? 12);
+        $cost = (int)(\app\common\Helper::getValue('security.admin_bcrypt_cost') ?? 12);
         $hash = password_hash($plain, PASSWORD_BCRYPT, ['cost' => $cost]);
         return [
             'password'      => $hash,
@@ -104,25 +112,25 @@ class ShopAdminAuth extends BaseController
         return null;
     }
 
-    /** 解析商户标识：支持 merchant_id / merchant_code / merchant_name */
+    /** 解析商户标识：支持 merchant_id / merchant_code / merchant_name（ORM版本） */
     private function resolveMerchantId(array $in): ?int
     {
         if (!empty($in['merchant_id'])) return (int)$in['merchant_id'];
         if (!empty($in['merchant_code'])) {
-            $id = Db::name('shopadmin_merchant')->where('merchant_code', $in['merchant_code'])->value('id');
+            $id = ShopAdminMerchant::where('merchant_code', $in['merchant_code'])->value('id');
             return $id ? (int)$id : null;
         }
         if (!empty($in['merchant_name'])) {
-            $id = Db::name('shopadmin_merchant')->where('merchant_name', $in['merchant_name'])->value('id');
+            $id = ShopAdminMerchant::where('merchant_name', $in['merchant_name'])->value('id');
             return $id ? (int)$id : null;
         }
         return null;
     }
 
-    /** 找到本租户“首位超管”的 admin_id（按创建时间/ID最早） */
+    /** 找到本租户“首位超管”的 admin_id（按创建时间/ID最早；ORM） */
     private function primarySuperAdminId(int $merchantId): ?int
     {
-        $row = Db::table('shopadmin_user')->alias('u')
+        $row = ShopAdminUser::alias('u')
             ->join(['shopadmin_user_role'=>'ur'],'ur.admin_id = u.id AND ur.merchant_id = u.merchant_id')
             ->join(['shopadmin_role'=>'r'],'r.id = ur.role_id AND r.merchant_id = u.merchant_id')
             ->where('u.merchant_id',$merchantId)
@@ -131,8 +139,8 @@ class ShopAdminAuth extends BaseController
             ->order('u.created_at','asc')
             ->order('u.id','asc')
             ->field('u.id')
-            ->limit(1)->find();
-        return $row ? (int)$row['id'] : null;
+            ->find();
+        return $row ? (int)$row->getAttr('id') : null;
     }
 
     /** 是否本租户“首位超管” */
@@ -143,13 +151,11 @@ class ShopAdminAuth extends BaseController
         return $pid === $adminId;
     }
 
-    /** 统计本租户“子账号”数量（不含首位超管；仅未软删） */
+    /** 统计本租户“子账号”数量（不含首位超管；仅未软删；ORM） */
     private function countSubAccounts(int $merchantId): int
     {
         $primaryId = $this->primarySuperAdminId($merchantId);
-        $q = Db::name('shopadmin_user')
-            ->where('merchant_id',$merchantId)
-            ->whereNull('deleted_at');
+        $q = ShopAdminUser::where('merchant_id',$merchantId)->whereNull('deleted_at');
         if ($primaryId) {
             $q->where('id','<>',$primaryId);
         }
@@ -239,17 +245,6 @@ class ShopAdminAuth extends BaseController
         return [$merchantId, $adminId, null];
     }
 
-    /** 规范化时间字段：空串->NULL；合法->标准化到秒；非法返回 '__INVALID__' */
-    private function normalizeDT($v)
-    {
-        if (!isset($v)) return null;
-        $v = trim((string)$v);
-        if ($v === '') return null;
-        $ts = strtotime($v);
-        if ($ts === false) return '__INVALID__';
-        return date('Y-m-d H:i:s', $ts);
-    }
-
     /** 解析角色（支持 role_id 或 role_code），并校验租户一致 */
     private function resolveRoleRow(int $merchantId, $roleId, $roleCode): ?ShopAdminRole
     {
@@ -266,10 +261,12 @@ class ShopAdminAuth extends BaseController
         return null;
     }
 
-    /** ✅ 严格按租户获取权限（纯 ORM；与现有表结构精确匹配） */
+    /**
+     * 严格按租户获取权限代码列表（ORM 联查）
+     * 注意：shopadmin_permission 为全局表（无 merchant_id）。
+     */
     private function getTenantPermCodesStrict(int $merchantId, int $adminId): array
     {
-        // 优先尝试租户维度缓存接口
         try {
             if (is_callable([PermissionCacheService::class, 'getAdminPermCodesForTenant'])) {
                 /** @phpstan-ignore-next-line */
@@ -284,11 +281,10 @@ class ShopAdminAuth extends BaseController
             Log::warning('PermissionCacheService::getAdminPermCodesForTenant failed: '.$e->getMessage());
         }
 
-        // 纯 ORM 联查：ur ➜ r ➜ rp ➜ p，全程强制 merchant_id 一致，避免串租户
         $codes = ShopAdminUserRole::alias('ur')
-            ->join(['shopadmin_role' => 'r'], 'r.id = ur.role_id AND r.merchant_id = ur.merchant_id')
+            ->join(['shopadmin_role' => 'r'],  'r.id = ur.role_id AND r.merchant_id = ur.merchant_id')
             ->join(['shopadmin_role_permission' => 'rp'], 'rp.role_id = ur.role_id AND rp.merchant_id = ur.merchant_id')
-            ->join(['shopadmin_permission' => 'p'], 'p.id = rp.permission_id AND p.merchant_id = ur.merchant_id')
+            ->join(['shopadmin_permission' => 'p'], 'p.id = rp.permission_id')
             ->where('ur.admin_id', $adminId)
             ->where('ur.merchant_id', $merchantId)
             ->distinct(true)
@@ -299,7 +295,7 @@ class ShopAdminAuth extends BaseController
         return $codes;
     }
 
-    /** ✅ 失效权限缓存（优先租户维度；无则回退全局） */
+    /** 失效权限缓存（优先租户维度；无则回退全局） */
     private function invalidatePermCache(int $merchantId, int $adminId): void
     {
         try {
@@ -320,7 +316,7 @@ class ShopAdminAuth extends BaseController
 
     // ========================= 业务接口 =========================
 
-    /** 注册（同租户创建账号）—— 含“子账号配额”校验 */
+    /** 注册（同租户创建账号）—— 含“子账号配额”校验 + 唯一性友好报错（ORM版） */
     public function register()
     {
         $in = Request::post();
@@ -333,73 +329,92 @@ class ShopAdminAuth extends BaseController
         if (!$merchantId) return $this->jsonResponse('缺少或无法解析商户标识', 422, 'error');
 
         $username = strtolower(trim((string)$in['username']));
+        $phone    = trim((string)($in['phone'] ?? ''));
+        $email    = strtolower(trim((string)($in['email'] ?? '')));
 
         try {
-            Db::startTrans();
+            Db::transaction(function () use ($merchantId, $username, $phone, $email, $in) {
+                // 锁商户行，校验可用与配额（ORM）
+                /** @var ShopAdminMerchant|null $m */
+                $m = ShopAdminMerchant::where('id',$merchantId)->lock(true)->find();
+                if (!$m)                  throw new \RuntimeException('商户不存在', 404);
+                if ((int)$m->getAttr('status')!==1) throw new \RuntimeException('商户已禁用', 403);
 
-            // 锁商户行
-            $m = Db::name('shopadmin_merchant')->where('id',$merchantId)->lock(true)->find();
-            if (!$m) throw new \RuntimeException('商户不存在');
-            if ((int)$m['status'] !== 1) throw new \RuntimeException('商户已禁用');
+                // 子账号配额（不含首位超管）
+                $subCnt = $this->countSubAccounts($merchantId);
+                $maxSub = (int)$m->getAttr('max_sub_accounts');
+                if ($subCnt >= $maxSub)  throw new \RuntimeException('子账号已达上限，无法新增', 409);
 
-            // 计算当前子账号数（不含首位超管）
-            $subCnt = $this->countSubAccounts($merchantId);
-            $maxSub = (int)$m['max_sub_accounts'];
-            if ($subCnt >= $maxSub) {
-                Db::rollback();
-                return $this->jsonResponse('子账号已达上限，无法新增', 409, 'error');
-            }
+                // 唯一性预检
+                if (ShopAdminUser::where('merchant_id',$merchantId)->where('username',$username)->find()) {
+                    throw new \RuntimeException('用户名已存在（当前商户）', 409);
+                }
+                if ($phone !== '' && ShopAdminUser::where('merchant_id',$merchantId)->where('phone',$phone)->find()) {
+                    throw new \RuntimeException('手机号已存在（当前商户）', 409);
+                }
+                if ($email !== '' && ShopAdminUser::where('merchant_id',$merchantId)->where('email',$email)->find()) {
+                    throw new \RuntimeException('邮箱已存在（当前商户）', 409);
+                }
 
-            // 同租户用户名唯一
-            $exists = ShopAdminUser::whereNull('deleted_at')
-                ->where('merchant_id',$merchantId)
-                ->where('username',$username)->find();
-            if ($exists) {
-                Db::rollback();
-                return $this->jsonResponse('用户名已存在（当前商户）', 409, 'error');
-            }
+                // 创建账号
+                $hp = $this->hashPassword((string)$in['password']);
+                /** @var ShopAdminUser $user */
+                $user = ShopAdminUser::create([
+                    'merchant_id'           => $merchantId,
+                    'username'              => $username,
+                    'password'              => $hp['password'],
+                    'password_algo'         => $hp['password_algo'],
+                    'password_meta'         => $hp['password_meta'],
+                    'email'                 => ($email !== '' ? $email : null),
+                    'phone'                 => ($phone !== '' ? $phone : null),
+                    'status'                => 1,
+                    'login_failed_attempts' => 0,
+                    'mfa_enabled'           => 0,
+                    'created_by'            => (int)($in['operator_id'] ?? 0) ?: null,
+                    'updated_by'            => null,
+                    'version'               => 0,
+                ]);
 
-            $hp = $this->hashPassword((string)$in['password']);
+                // 密码历史
+                ShopAdminUserPasswordHistory::create([
+                    'merchant_id'  => $merchantId,
+                    'admin_id'     => (int)$user->id,
+                    'password'     => $hp['password'],
+                    'password_algo'=> $hp['password_algo'],
+                    'password_meta'=> $hp['password_meta'],
+                    'changed_at'   => date('Y-m-d H:i:s'),
+                    'changed_by'   => (int)$user->id,
+                    'reason'       => 'active',
+                    'client_info'  => sprintf('ip=%s; ua=%s', Request::ip() ?? '', substr(Request::server('HTTP_USER_AGENT') ?? '',0,180)),
+                ]);
 
-            /** @var ShopAdminUser $user */
-            $user = ShopAdminUser::create([
-                'merchant_id'           => $merchantId,
-                'username'              => $username,
-                'password'              => $hp['password'],
-                'password_algo'         => $hp['password_algo'],
-                'password_meta'         => $hp['password_meta'],
-                'email'                 => $in['email'] ?? null,
-                'phone'                 => $in['phone'] ?? null,
-                'status'                => 1,
-                'login_failed_attempts' => 0,
-                'mfa_enabled'           => 0,
-                'created_by'            => (int)($in['operator_id'] ?? 0) ?: null,
-                'updated_by'            => null,
-                'version'               => 0,
-            ]);
+                // 增加当前子账号计数（ORM）
+                ShopAdminMerchant::where('id',$merchantId)->inc('current_sub_accounts',1)->update();
+            });
 
-            ShopAdminUserPasswordHistory::create([
-                'merchant_id'  => $merchantId,
-                'admin_id'     => (int)$user->id,
-                'password'     => $hp['password'],
-                'password_algo'=> $hp['password_algo'],
-                'password_meta'=> $hp['password_meta'],
-                'changed_at'   => date('Y-m-d H:i:s'),
-                'changed_by'   => (int)$user->id,
-                'reason'       => 'active',
-                'client_info'  => sprintf('ip=%s; ua=%s', Request::ip() ?? '', substr(Request::server('HTTP_USER_AGENT') ?? '',0,180)),
-            ]);
+            // 回查新建用户ID（按用户名/商户）
+            $userId = (int)ShopAdminUser::where('merchant_id',$merchantId)->where('username',$username)->value('id');
 
-            // 原子更新商户当前子账号数（不含首位超管）
-            Db::name('shopadmin_merchant')->where('id',$merchantId)->inc('current_sub_accounts',1)->update();
-
-            Db::commit();
             return $this->jsonResponse('创建成功', 200, 'success', [
-                'admin_id'    => (int)$user->id,
+                'admin_id'    => $userId,
                 'merchant_id' => $merchantId
             ]);
+        } catch (\RuntimeException $e) {
+            $code = $e->getCode() ?: 400;
+            return $this->jsonResponse($e->getMessage(), $code, 'error');
         } catch (\Throwable $e) {
-            if (Db::isTransaction()) Db::rollback();
+            $msg = $e->getMessage();
+            if (stripos($msg, 'Duplicate entry') !== false) {
+                if (stripos($msg, 'uk_user_merchant_phone') !== false) {
+                    return $this->jsonResponse('手机号已存在（当前商户）', 409, 'error');
+                }
+                if (stripos($msg, 'uk_user_merchant_username') !== false || stripos($msg, 'uk_user_merchant_uname') !== false) {
+                    return $this->jsonResponse('用户名已存在（当前商户）', 409, 'error');
+                }
+                if (stripos($msg, 'uk_user_merchant_email') !== false) {
+                    return $this->jsonResponse('邮箱已存在（当前商户）', 409, 'error');
+                }
+            }
             Log::error('ShopAdminAuth::register failed: ' . $e->getMessage());
             return $this->jsonResponse('服务器忙，请稍后重试', 500, 'error');
         }
@@ -408,6 +423,8 @@ class ShopAdminAuth extends BaseController
     /** 登录（仅 access；有效 6 小时） */
     public function login()
     {
+        var_dump(123);
+        die();
         $in = Request::post();
         $v = new ShopAdminLoginValidate();
         if (!$v->check($in)) {
@@ -417,8 +434,9 @@ class ShopAdminAuth extends BaseController
         $merchantId = $this->resolveMerchantId($in);
         if (!$merchantId) return $this->jsonResponse('缺少或无法解析商户标识', 422, 'error');
 
-        $m = Db::name('shopadmin_merchant')->where('id',$merchantId)->find();
-        if (!$m || (int)$m['status'] !== 1) {
+        /** @var ShopAdminMerchant|null $m */
+        $m = ShopAdminMerchant::where('id',$merchantId)->find();
+        if (!$m || (int)$m->getAttr('status') !== 1) {
             return $this->jsonResponse('商户不可用或不存在', 403, 'error');
         }
 
@@ -451,7 +469,7 @@ class ShopAdminAuth extends BaseController
         $needRehash = password_needs_rehash(
             (string)$user->getAttr('password'),
             PASSWORD_BCRYPT,
-            ['cost' => (int)(config('security.admin_bcrypt_cost') ?? 12)]
+            ['cost' => (int)(\app\common\Helper::getValue('security.admin_bcrypt_cost') ?? 12)]
         );
         if ($needRehash) {
             $hp = $this->hashPassword((string)$in['password']);
@@ -478,11 +496,10 @@ class ShopAdminAuth extends BaseController
         $adminId   = (int)$user->id;
         $roleCodes = $this->activeRoleCodes($merchantId, $adminId);
         $isPrimary = $this->isPrimarySuperAdmin($merchantId, $adminId);
-        $roleLevel = $isPrimary ? $this->SUPER_CODE : $this->bestRoleLevel($merchantId, $adminId);
-
-        // ✅ 严格租户隔离的权限集
+        $roleLevel = $isPrimary ? 0 : $this->bestRoleLevel($merchantId, $adminId);
         $permCodes = $this->getTenantPermCodesStrict($merchantId, $adminId);
 
+        // 颁发 token
         $payload = [
             'user_id'     => $adminId,
             'merchant_id' => $merchantId,
@@ -493,6 +510,7 @@ class ShopAdminAuth extends BaseController
         $tokens = $this->tokenService->issue($payload, $this->accessTtlSeconds, $this->accessTtlSeconds);
         $access = $tokens['access'] ?? ($tokens['access_token'] ?? '');
 
+        // 状态更新
         ShopAdminUser::where('id', $adminId)
             ->inc('version')
             ->update([
@@ -502,6 +520,15 @@ class ShopAdminAuth extends BaseController
                 'last_login_ip'         => $this->ipToBin($ip),
             ]);
 
+        // 清除节流计数桶（登录成功后）
+        try {
+            $bucket = sprintf('salogin:%s:%s:%s', (string)$merchantId, strtolower($username), $ip);
+            Cache::delete("attempts:{$bucket}");
+            Cache::delete("lock:{$bucket}");
+        } catch (\Throwable $e) {
+            Log::warning('clear throttle bucket failed: '.$e->getMessage());
+        }
+
         $this->writeLoginAudit($merchantId, $adminId, $username, 'SUCCESS', null);
 
         return $this->jsonResponse('登录成功', 200, 'success', [
@@ -510,7 +537,7 @@ class ShopAdminAuth extends BaseController
             'merchant_id'      => $merchantId,
             'roles'            => $roleCodes,
             'perms'            => $permCodes,
-            'role_level'       => $roleLevel,
+            'role_level'       => $roleLevel,      // int：0=首位超管；越小权限越高
             'is_primary_super' => $isPrimary ? 1 : 0,
         ]);
     }
@@ -551,7 +578,7 @@ class ShopAdminAuth extends BaseController
             return $this->jsonResponse('旧密码不正确', 400, 'error');
         }
 
-        $N = (int)(config('security.pwd_history_depth') ?? 5);
+        $N = (int)(\app\common\Helper::getValue('security.pwd_history_depth') ?? 5);
         $history = ShopAdminUserPasswordHistory::where('merchant_id',$merchantId)
             ->where('admin_id',$adminId)->order('changed_at','desc')->limit($N)->select();
         foreach ($history as $row) {
@@ -563,94 +590,241 @@ class ShopAdminAuth extends BaseController
         $hp = $this->hashPassword($in['new_password']);
 
         try {
-            Db::startTrans();
+            Db::transaction(function () use ($merchantId, $adminId, $hp) {
+                ShopAdminUser::where('id',$adminId)
+                    ->where('merchant_id',$merchantId)
+                    ->inc('version')
+                    ->update([
+                        'password'      => $hp['password'],
+                        'password_algo' => $hp['password_algo'],
+                        'password_meta' => $hp['password_meta'],
+                        'updated_at'    => date('Y-m-d H:i:s'),
+                        'updated_by'    => $adminId,
+                    ]);
 
-            ShopAdminUser::where('id',$adminId)
-                ->where('merchant_id',$merchantId)
-                ->inc('version')
-                ->update([
-                    'password'      => $hp['password'],
-                    'password_algo' => $hp['password_algo'],
-                    'password_meta' => $hp['password_meta'],
-                    'updated_at'    => date('Y-m-d H:i:s'),
-                    'updated_by'    => $adminId,
+                ShopAdminUserPasswordHistory::create([
+                    'merchant_id'  => $merchantId,
+                    'admin_id'     => $adminId,
+                    'password'     => $hp['password'],
+                    'password_algo'=> $hp['password_algo'],
+                    'password_meta'=> $hp['password_meta'],
+                    'changed_at'   => date('Y-m-d H:i:s'),
+                    'changed_by'   => $adminId,
+                    'reason'       => 'active',
+                    'client_info'  => sprintf('ip=%s; ua=%s', Request::ip() ?? '', substr(Request::server('HTTP_USER_AGENT') ?? '',0,180)),
                 ]);
+            });
 
-            ShopAdminUserPasswordHistory::create([
-                'merchant_id'  => $merchantId,
-                'admin_id'     => $adminId,
-                'password'     => $hp['password'],
-                'password_algo'=> $hp['password_algo'],
-                'password_meta'=> $hp['password_meta'],
-                'changed_at'   => date('Y-m-d H:i:s'),
-                'changed_by'   => $adminId,
-                'reason'       => 'active',
-                'client_info'  => sprintf('ip=%s; ua=%s', Request::ip() ?? '', substr(Request::server('HTTP_USER_AGENT') ?? '',0,180)),
-            ]);
-
-            Db::commit();
             return $this->jsonResponse('密码已更新', 200, 'success');
         } catch (\Throwable $e) {
-            Db::rollback();
             Log::error('ShopAdminAuth::changePassword failed: ' . $e->getMessage());
             return $this->jsonResponse('服务器忙，请稍后重试', 500, 'error');
         }
     }
 
     /**
-     * 删除管理员（软删 + 回收配额）
-     * 约束：仅本租户“首位 super_shopadmin”可操作；不可删除自己与首位超管本身
-     * 入参：target_admin_id
+     * 是否为“本商户超管”（启用且在有效期内；按租户隔离）
      */
-    public function deleteAdmin()
+    private function isSuperAdminInTenant(int $merchantId, int $adminId): bool
+    {
+        $now = date('Y-m-d H:i:s');
+        return ShopAdminUserRole::alias('ur')
+                ->join(['shopadmin_role' => 'r'], 'r.id = ur.role_id AND r.merchant_id = ur.merchant_id')
+                ->where('ur.merchant_id', $merchantId)
+                ->where('ur.admin_id', $adminId)
+                ->where('r.code', $this->SUPER_CODE)
+                ->where('r.status', 1)
+                // 角色有效期 [from, to)
+                ->where(function($q) use ($now){ $q->whereNull('r.valid_from')->whereOr('r.valid_from','<=',$now); })
+                ->where(function($q) use ($now){ $q->whereNull('r.valid_to')->whereOr('r.valid_to','>',$now); })
+                // 分配有效期 [from, to)
+                ->where(function($q) use ($now){ $q->whereNull('ur.valid_from')->whereOr('ur.valid_from','<=',$now); })
+                ->where(function($q) use ($now){ $q->whereNull('ur.valid_to')->whereOr('ur.valid_to','>',$now); })
+                ->count() > 0;
+    }
+
+    /**
+     * 修改子账号信息（仅“商户超管”可操作；不可修改首位超管）
+     * 可修改字段（可选）：username/email/phone/status(0|1)
+     */
+    public function updateSubAccount()
     {
         [$merchantId, $callerId, $err] = $this->requireShopAdminSession();
         if ($err) return $err;
 
-        $targetId = (int)(Request::post('target_admin_id') ?? 0);
-        if ($targetId <= 0) return $this->jsonResponse('缺少目标账号ID', 422, 'error');
-
-        // 权限校验：必须为首位超管
-        if (!$this->isPrimarySuperAdmin($merchantId, $callerId)) {
-            return $this->jsonResponse('无权限：仅初始超管可执行', 403, 'error');
+        if (!$this->isSuperAdminInTenant($merchantId, $callerId)) {
+            return $this->jsonResponse('无权限：仅商户超管可操作', 403, 'error');
         }
 
-        // 不能删除自己；不能删除首位超管
-        $primaryId = $this->primarySuperAdminId($merchantId);
-        if ($targetId === $callerId || $targetId === $primaryId) {
-            return $this->jsonResponse('禁止删除自身或初始超管', 400, 'error');
+        $in = Request::post();
+        $targetId = (int)($in['target_admin_id'] ?? 0);
+        if ($targetId <= 0) return $this->jsonResponse('缺少 target_admin_id', 422, 'error');
+
+        /** @var ShopAdminUser|null $u */
+        $u = ShopAdminUser::where('merchant_id',$merchantId)->where('id',$targetId)->whereNull('deleted_at')->find();
+        if (!$u) return $this->jsonResponse('目标账号不存在', 404, 'error');
+        if ($this->isPrimarySuperAdmin($merchantId, $targetId)) {
+            return $this->jsonResponse('禁止修改首位超管信息', 403, 'error');
         }
+
+        $sets = [];
+        $usernameProvided = array_key_exists('username', $in);
+        $emailProvided    = array_key_exists('email',    $in);
+        $phoneProvided    = array_key_exists('phone',    $in);
+        $statusProvided   = array_key_exists('status',   $in);
+
+        if (!$usernameProvided && !$emailProvided && !$phoneProvided && !$statusProvided) {
+            return $this->jsonResponse('无可更新字段（可传：username/email/phone/status）', 400, 'error');
+        }
+
+        if ($usernameProvided) {
+            $newUsername = strtolower(trim((string)$in['username']));
+            if ($newUsername === '') return $this->jsonResponse('username 不能为空', 422, 'error');
+            if ($newUsername !== (string)$u->getAttr('username')) {
+                $dup = ShopAdminUser::where('merchant_id',$merchantId)
+                    ->where('username',$newUsername)->where('id','<>',$targetId)->find();
+                if ($dup) return $this->jsonResponse('用户名已存在（当前商户）', 409, 'error');
+                $sets['username'] = $newUsername;
+            }
+        }
+
+        if ($emailProvided) {
+            $newEmail = strtolower(trim((string)$in['email']));
+            $newEmail = ($newEmail === '') ? null : $newEmail;
+            if ($newEmail !== (string)$u->getAttr('email')) {
+                if ($newEmail !== null) {
+                    $dup = ShopAdminUser::where('merchant_id',$merchantId)
+                        ->where('email',$newEmail)->where('id','<>',$targetId)->find();
+                    if ($dup) return $this->jsonResponse('邮箱已存在（当前商户）', 409, 'error');
+                }
+                $sets['email'] = $newEmail;
+            }
+        }
+
+        if ($phoneProvided) {
+            $newPhone = trim((string)$in['phone']);
+            $newPhone = ($newPhone === '') ? null : $newPhone;
+            if ($newPhone !== (string)$u->getAttr('phone')) {
+                if ($newPhone !== null) {
+                    $dup = ShopAdminUser::where('merchant_id',$merchantId)
+                        ->where('phone',$newPhone)->where('id','<>',$targetId)->find();
+                    if ($dup) return $this->jsonResponse('手机号已存在（当前商户）', 409, 'error');
+                }
+                $sets['phone'] = $newPhone;
+            }
+        }
+
+        if ($statusProvided) {
+            $sv = (int)$in['status'];
+            if (!in_array($sv, [0,1], true)) return $this->jsonResponse('status 仅允许 0 或 1', 422, 'error');
+            if ($sv !== (int)$u->getAttr('status')) {
+                $sets['status'] = $sv;
+            }
+        }
+
+        if (!$sets) return $this->jsonResponse('没有需要更新的内容', 400, 'error');
 
         try {
-            Db::startTrans();
+            $sets['updated_at'] = date('Y-m-d H:i:s');
+            $sets['updated_by'] = $callerId;
+            ShopAdminUser::where('id',$targetId)->where('merchant_id',$merchantId)
+                ->inc('version')->update($sets);
 
-            $u = ShopAdminUser::where('id',$targetId)->where('merchant_id',$merchantId)->whereNull('deleted_at')->find();
-            if (!$u) {
-                Db::rollback();
+            return $this->jsonResponse('更新成功', 200, 'success');
+        } catch (\Throwable $e) {
+            $msg = $e->getMessage();
+            if (stripos($msg, 'Duplicate entry') !== false) {
+                if (stripos($msg, 'uk_user_merchant_username') !== false || stripos($msg, 'uk_user_merchant_uname') !== false) {
+                    return $this->jsonResponse('用户名已存在（当前商户）', 409, 'error');
+                }
+                if (stripos($msg, 'uk_user_merchant_email') !== false) {
+                    return $this->jsonResponse('邮箱已存在（当前商户）', 409, 'error');
+                }
+                if (stripos($msg, 'uk_user_merchant_phone') !== false) {
+                    return $this->jsonResponse('手机号已存在（当前商户）', 409, 'error');
+                }
+            }
+            Log::error('updateSubAccount error: ' . $e->getMessage());
+            return $this->jsonResponse('更新失败，请稍后重试', 500, 'error');
+        }
+    }
+
+    /**
+     * 删除子账号（软删 + 回收子账号配额；仅“商户超管”可操作；禁止删除首位超管与自己）
+     * 入参：target_admin_id
+     */
+    /**
+     * 删除子账号（物理删除 + 回收子账号配额；仅“商户超管”可操作；禁止删除首位超管与自己）
+     * 入参：target_admin_id
+     */
+    public function deleteSubAccount()
+    {
+        [$merchantId, $callerId, $err] = $this->requireShopAdminSession();
+        if ($err) return $err;
+
+        // 仅“商户超管”可操作
+        if (!$this->isSuperAdminInTenant($merchantId, $callerId)) {
+            return $this->jsonResponse('无权限：仅商户超管可操作', 403, 'error');
+        }
+
+        $targetId = (int)(Request::post('target_admin_id') ?? 0);
+        if ($targetId <= 0) return $this->jsonResponse('缺少 target_admin_id', 422, 'error');
+
+        $primaryId = $this->primarySuperAdminId($merchantId);
+        if ($targetId === $callerId)  return $this->jsonResponse('禁止删除自己', 400, 'error');
+        if ($targetId === $primaryId) return $this->jsonResponse('禁止删除首位超管', 403, 'error');
+
+        try {
+            Db::transaction(function () use ($merchantId, $targetId) {
+                // 锁定目标用户
+                $u = ShopAdminUser::where('id', $targetId)
+                    ->where('merchant_id', $merchantId)
+                    ->lock(true)
+                    ->find();
+                if (!$u) {
+                    throw new \RuntimeException('NOT_FOUND');
+                }
+
+                // 清理关联（避免残留/外键约束）
+                ShopAdminUserRole::where([
+                    'merchant_id' => $merchantId,
+                    'admin_id'    => $targetId,
+                ])->delete();
+
+                ShopAdminUserPasswordHistory::where([
+                    'merchant_id' => $merchantId,
+                    'admin_id'    => $targetId,
+                ])->delete();
+
+                // 如有其它绑定表（设备指纹、MFA、会话、通知偏好等），在此追加清理
+
+                // 物理删除账号
+                ShopAdminUser::where('id', $targetId)
+                    ->where('merchant_id', $merchantId)
+                    ->delete();
+
+                // 回收配额（原子表达式防止负数）
+                ShopAdminMerchant::where('id', $merchantId)->update([
+                    'current_sub_accounts' => Db::raw('CASE WHEN current_sub_accounts>0 THEN current_sub_accounts-1 ELSE 0 END')
+                ]);
+            });
+
+            // 失效被删用户的权限缓存
+            $this->invalidatePermCache($merchantId, $targetId);
+
+            return $this->jsonResponse('账号已删除', 200, 'success');
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() === 'NOT_FOUND') {
                 return $this->jsonResponse('目标账号不存在或已删除', 404, 'error');
             }
-
-            // 软删 + 停用
-            ShopAdminUser::where('id',$targetId)->where('merchant_id',$merchantId)->update([
-                'status'     => 0,
-                'deleted_at' => date('Y-m-d H:i:s'),
-                'updated_at' => date('Y-m-d H:i:s'),
-                'updated_by' => $callerId,
-            ]);
-
-            // 回收配额（原子自减，不低于0）
-            Db::name('shopadmin_merchant')->where('id',$merchantId)->lock(true)->update([
-                'current_sub_accounts' => Db::raw('GREATEST(current_sub_accounts - 1, 0)')
-            ]);
-
-            Db::commit();
-            return $this->jsonResponse('账号已删除', 200, 'success');
+            Log::error('deleteSubAccount runtime error: ' . $e->getMessage());
+            return $this->jsonResponse('删除失败，请稍后重试', 500, 'error');
         } catch (\Throwable $e) {
-            if (Db::isTransaction()) Db::rollback();
-            Log::error('ShopAdminAuth::deleteAdmin failed: ' . $e->getMessage());
+            Log::error('deleteSubAccount failed: ' . $e->getMessage());
             return $this->jsonResponse('删除失败，请稍后重试', 500, 'error');
         }
     }
+
 
     /**
      * 重置他人密码（仅初始超管）
@@ -686,7 +860,7 @@ class ShopAdminAuth extends BaseController
         if (!$u) return $this->jsonResponse('目标账号不存在', 404, 'error');
 
         // 近 N 次不可复用
-        $N = (int)(config('security.pwd_history_depth') ?? 5);
+        $N = (int)(\app\common\Helper::getValue('security.pwd_history_depth') ?? 5);
         $history = ShopAdminUserPasswordHistory::where('merchant_id',$merchantId)
             ->where('admin_id',$targetId)->order('changed_at','desc')->limit($N)->select();
         foreach ($history as $row) {
@@ -698,33 +872,31 @@ class ShopAdminAuth extends BaseController
         $hp = $this->hashPassword($newPwd);
 
         try {
-            Db::startTrans();
+            Db::transaction(function () use ($merchantId, $callerId, $targetId, $hp) {
+                ShopAdminUser::where('id',$targetId)->where('merchant_id',$merchantId)
+                    ->inc('version')->update([
+                        'password'      => $hp['password'],
+                        'password_algo' => $hp['password_algo'],
+                        'password_meta' => $hp['password_meta'],
+                        'updated_at'    => date('Y-m-d H:i:s'),
+                        'updated_by'    => $callerId,
+                    ]);
 
-            ShopAdminUser::where('id',$targetId)->where('merchant_id',$merchantId)
-                ->inc('version')->update([
-                    'password'      => $hp['password'],
-                    'password_algo' => $hp['password_algo'],
-                    'password_meta' => $hp['password_meta'],
-                    'updated_at'    => date('Y-m-d H:i:s'),
-                    'updated_by'    => $callerId,
+                ShopAdminUserPasswordHistory::create([
+                    'merchant_id'  => $merchantId,
+                    'admin_id'     => $targetId,
+                    'password'     => $hp['password'],
+                    'password_algo'=> $hp['password_algo'],
+                    'password_meta'=> $hp['password_meta'],
+                    'changed_at'   => date('Y-m-d H:i:s'),
+                    'changed_by'   => $callerId,
+                    'reason'       => 'reset',
+                    'client_info'  => sprintf('ip=%s; ua=%s', Request::ip() ?? '', substr(Request::server('HTTP_USER_AGENT') ?? '',0,180)),
                 ]);
+            });
 
-            ShopAdminUserPasswordHistory::create([
-                'merchant_id'  => $merchantId,
-                'admin_id'     => $targetId,
-                'password'     => $hp['password'],
-                'password_algo'=> $hp['password_algo'],
-                'password_meta'=> $hp['password_meta'],
-                'changed_at'   => date('Y-m-d H:i:s'),
-                'changed_by'   => $callerId,
-                'reason'       => 'reset',
-                'client_info'  => sprintf('ip=%s; ua=%s', Request::ip() ?? '', substr(Request::server('HTTP_USER_AGENT') ?? '',0,180)),
-            ]);
-
-            Db::commit();
             return $this->jsonResponse('密码已重置', 200, 'success');
         } catch (\Throwable $e) {
-            if (Db::isTransaction()) Db::rollback();
             Log::error('ShopAdminAuth::resetOtherPassword failed: ' . $e->getMessage());
             return $this->jsonResponse('重置失败，请稍后重试', 500, 'error');
         }
@@ -746,8 +918,13 @@ class ShopAdminAuth extends BaseController
         $adminId = (int)(Request::post('admin_id') ?? 0);
         $roleId  = (int)(Request::post('role_id') ?? 0);
         $roleCode= (string)(Request::post('role_code') ?? '');
-        $vf      = $this->normalizeDT(Request::post('valid_from'));
-        $vt      = $this->normalizeDT(Request::post('valid_to'));
+        $vfRaw = Request::post('valid_from', null);
+        $vtRaw = Request::post('valid_to', null);
+        if (is_string($vfRaw) && trim($vfRaw) === '') $vfRaw = null;
+        if (is_string($vtRaw) && trim($vtRaw) === '') $vtRaw = null;
+
+        $vf = $this->normalizeDT($vfRaw);
+        $vt = $this->normalizeDT($vtRaw);
         $token   = (string)(Request::post('confirmation_token') ?? '');
 
         if ($adminId<=0 || ($roleId<=0 && $roleCode==='')) {
@@ -775,44 +952,41 @@ class ShopAdminAuth extends BaseController
         if (!$role) return $this->jsonResponse('角色不存在（或不属于当前商户）', 404, 'error');
 
         try {
-            Db::startTrans();
-
-            // 存在则更新有效期；不存在则创建
-            $map = [
-                'merchant_id' => $merchantId,
-                'admin_id'    => $adminId,
-                'role_id'     => (int)$role->id,
-            ];
-            $exist = ShopAdminUserRole::where($map)->find();
-            $now = date('Y-m-d H:i:s');
-
-            if ($exist) {
-                ShopAdminUserRole::where($map)->update([
-                    'valid_from'  => $vf,
-                    'valid_to'    => $vt,
-                    'assigned_at' => $now,
-                    'assigned_by' => $callerId,
-                ]);
-            } else {
-                ShopAdminUserRole::create([
+            Db::transaction(function () use ($merchantId, $callerId, $adminId, $role, $vf, $vt) {
+                // 存在则更新有效期；不存在则创建
+                $map = [
                     'merchant_id' => $merchantId,
                     'admin_id'    => $adminId,
                     'role_id'     => (int)$role->id,
-                    'valid_from'  => $vf,
-                    'valid_to'    => $vt,
-                    'assigned_at' => $now,
-                    'assigned_by' => $callerId,
-                ]);
-            }
+                ];
+                $exist = ShopAdminUserRole::where($map)->find();
+                $now = date('Y-m-d H:i:s');
 
-            Db::commit();
+                if ($exist) {
+                    ShopAdminUserRole::where($map)->update([
+                        'valid_from'  => $vf,
+                        'valid_to'    => $vt,
+                        'assigned_at' => $now,
+                        'assigned_by' => $callerId,
+                    ]);
+                } else {
+                    ShopAdminUserRole::create([
+                        'merchant_id' => $merchantId,
+                        'admin_id'    => $adminId,
+                        'role_id'     => (int)$role->id,
+                        'valid_from'  => $vf,
+                        'valid_to'    => $vt,
+                        'assigned_at' => $now,
+                        'assigned_by' => $callerId,
+                    ]);
+                }
+            });
 
-            // 失效权限缓存（目标账号）—— 优先租户维度
+            // 失效权限缓存（目标账号）
             $this->invalidatePermCache($merchantId, $adminId);
 
             return $this->jsonResponse('分配成功', 200, 'success');
         } catch (\Throwable $e) {
-            if (Db::isTransaction()) Db::rollback();
             Log::error('ShopAdminAuth::assignRoleToUser failed: '.$e->getMessage());
             return $this->jsonResponse('分配失败，请稍后重试', 500, 'error');
         }
@@ -855,22 +1029,20 @@ class ShopAdminAuth extends BaseController
         if (!$role) return $this->jsonResponse('角色不存在（或不属于当前商户）', 404, 'error');
 
         try {
-            Db::startTrans();
+            $affected = 0;
+            Db::transaction(function () use ($merchantId, $adminId, $role, &$affected) {
+                $affected = ShopAdminUserRole::where([
+                    'merchant_id' => $merchantId,
+                    'admin_id'    => $adminId,
+                    'role_id'     => (int)$role->id,
+                ])->delete();
+            });
 
-            $affected = ShopAdminUserRole::where([
-                'merchant_id' => $merchantId,
-                'admin_id'    => $adminId,
-                'role_id'     => (int)$role->id,
-            ])->delete();
-
-            Db::commit();
-
-            // 失效权限缓存（目标账号）—— 优先租户维度
+            // 失效权限缓存（目标账号）
             if ($affected) $this->invalidatePermCache($merchantId, $adminId);
 
             return $this->jsonResponse('撤销成功', 200, 'success');
         } catch (\Throwable $e) {
-            if (Db::isTransaction()) Db::rollback();
             Log::error('ShopAdminAuth::revokeRoleFromUser failed: '.$e->getMessage());
             return $this->jsonResponse('撤销失败，请稍后重试', 500, 'error');
         }
@@ -950,21 +1122,21 @@ class ShopAdminAuth extends BaseController
             $adminId   = (int)$r->getAttr('id');
             $roleCodes = $this->activeRoleCodes($merchantId, $adminId);
             $isPrimary = ($adminId === $primaryId);
-            $roleLevel = $isPrimary ? $this->SUPER_CODE : $this->bestRoleLevel($merchantId, $adminId);
+            $roleLevel = $isPrimary ? 0 : $this->bestRoleLevel($merchantId, $adminId);
 
             $items[] = [
-                'id'             => $adminId,
-                'username'       => (string)$r->getAttr('username'),
-                'email'          => (string)$r->getAttr('email'),
-                'phone'          => (string)$r->getAttr('phone'),
-                'status'         => (int)$r->getAttr('status'),
-                'created_at'     => (string)$r->getAttr('created_at'),
-                'updated_at'     => (string)$r->getAttr('updated_at'),
-                'last_login_at'  => (string)$r->getAttr('last_login_at'),
-                'last_login_ip'  => $this->binToIp($r->getAttr('last_login_ip')),
-                'roles'          => $roleCodes,
+                'id'              => $adminId,
+                'username'        => (string)$r->getAttr('username'),
+                'email'           => (string)$r->getAttr('email'),
+                'phone'           => (string)$r->getAttr('phone'),
+                'status'          => (int)$r->getAttr('status'),
+                'created_at'      => (string)$r->getAttr('created_at'),
+                'updated_at'      => (string)$r->getAttr('updated_at'),
+                'last_login_at'   => (string)$r->getAttr('last_login_at'),
+                'last_login_ip'   => $this->binToIp($r->getAttr('last_login_ip')),
+                'roles'           => $roleCodes,
                 'is_primary_super'=> $isPrimary ? 1 : 0,
-                'role_level'     => $roleLevel,
+                'role_level'      => $roleLevel,
             ];
         }
 
@@ -977,4 +1149,8 @@ class ShopAdminAuth extends BaseController
             'filters'    => ['keyword' => $keyword, 'status' => $status, 'role_code' => $roleCode],
         ]);
     }
+
+
+
+    // ========================= /业务接口 =========================
 }

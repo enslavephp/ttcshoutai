@@ -50,10 +50,13 @@ class AdminAuth extends BaseController
     public function __construct()
     {
         // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
     }
 
@@ -99,7 +102,7 @@ class AdminAuth extends BaseController
     /** hash 密码（记录算法参数，便于后续 needs_rehash） */
     private function hashPassword(string $plain): array
     {
-        $cost = (int)(config('security.admin_bcrypt_cost') ?? 12); // 获取 bcrypt 算法的 cost 参数
+        $cost = (int)(\app\common\Helper::getValue('security.admin_bcrypt_cost') ?? 12); // 获取 bcrypt 算法的 cost 参数
         $hash = password_hash($plain, PASSWORD_BCRYPT, ['cost' => $cost]); // 使用 bcrypt 加密密码
         return [
             'password'      => $hash,
@@ -130,7 +133,7 @@ class AdminAuth extends BaseController
     /** 等级排序方向：'asc'（默认）/ 'desc' */
     private function levelOrder(): string
     {
-        $order = (string)(config('permission.level_order') ?? 'asc');
+        $order = (string)(\app\common\Helper::getValue('permission.level_order') ?? 'asc');
         return ($order === 'desc') ? 'desc' : 'asc';
     }
 
@@ -138,8 +141,7 @@ class AdminAuth extends BaseController
     private function isSuperAdmin(int $adminId): bool
     {
         $now   = date('Y-m-d H:i:s');
-        $super = (string)(config('permission.super_admin_code') ?? 'super_admin');
-
+        $super = (string)(\app\common\Helper::getValue('permission.super_admin_code') ?? 'super_admin');
         return AdminUserRole::alias('ur')
                 ->join(['admin_role'=>'r'],'r.id = ur.role_id')
                 ->where('ur.admin_id', $adminId)
@@ -215,7 +217,7 @@ class AdminAuth extends BaseController
         }
 
         $username = strtolower(trim($data['username']));
-        $exists = AdminUser::whereNull('deleted_at')->where('username', $username)->find();
+        $exists = AdminUser::where('username', $username)->find();
         if ($exists) {
             return $this->jsonResponse('用户名已存在', 400, 'error');
         }
@@ -315,7 +317,7 @@ class AdminAuth extends BaseController
         $needRehash = password_needs_rehash(
             (string)$user->getAttr('password'),
             PASSWORD_BCRYPT,
-            ['cost' => (int)(config('security.admin_bcrypt_cost') ?? 12)]
+            ['cost' => (int)(\app\common\Helper::getValue('security.admin_bcrypt_cost') ?? 12)]
         );
         if ($needRehash) {
             $hp = $this->hashPassword($data['password']);
@@ -348,7 +350,8 @@ class AdminAuth extends BaseController
         // 权限代码：从缓存服务读取（未命中会自动回源并缓存）
         $permCodes = PermissionCacheService::getAdminPermCodes($adminId);
 
-        $super = (string)(config('permission.super_admin_code') ?? 'super_admin');
+        $super = (string)(\app\common\Helper::getValue('permission.super_admin_code') ?? 'super_admin');
+
         // 最高等级 or 超级管理员
         $roleLevelReturn = $this->isSuperAdmin($adminId) ? $super : $this->bestRoleLevelOfAdmin($adminId);
 
@@ -436,7 +439,7 @@ class AdminAuth extends BaseController
         }
 
         // 禁止近 N 次复用
-        $N = (int)(config('security.pwd_history_depth') ?? 5);
+        $N = (int)(\app\common\Helper::getValue('security.pwd_history_depth') ?? 5);
         $history = AdminUserPasswordHistory::where('admin_id', $adminId)
             ->order('changed_at', 'desc')->limit($N)->select();
         foreach ($history as $row) {
@@ -597,7 +600,7 @@ class AdminAuth extends BaseController
             $roleCodes   = $this->activeRoleCodesOfAdmin($adminId);
             $isSuper     = $this->isSuperAdmin($adminId);
             $roleLevel   = $isSuper
-                ? (string)(config('permission.super_admin_code') ?? 'super_admin') // 与 login() 对齐
+                ? (string)(\app\common\Helper::getValue('permission.super_admin_code') ?? 'super_admin')
                 : $this->bestRoleLevelOfAdmin($adminId);
 
             $items[] = [
@@ -626,4 +629,86 @@ class AdminAuth extends BaseController
             'filters'    => ['keyword' => $keyword, 'status' => $status, 'role_code' => $roleCode],
         ]);
     }
+
+    /**
+     * 删除管理员（物理删除 + 解除角色绑定）
+     * - 鉴权：admin realm 的 Bearer Token
+     * - 限制：不能删除自己；超级管理员不可删除
+     *
+     * 请求示例：
+     * { "admin_id": 123 }
+     */
+    public function deleteAdmin()
+    {
+        // 1) 解析并校验会话
+        $auth = Request::header('Authorization') ?: '';
+        $raw  = (stripos($auth, 'Bearer ') === 0) ? substr($auth, 7) : '';
+        if (!$raw) return $this->jsonResponse('未登录', 401, 'error');
+
+        try {
+            $claims = $this->tokenService->parse($raw);
+        } catch (\Throwable $e) {
+            return $this->jsonResponse('会话无效', 401, 'error');
+        }
+        if (($claims->realm ?? '') !== 'admin') {
+            return $this->jsonResponse('非法领域', 403, 'error');
+        }
+        $operatorId = (int)($claims->user_id ?? 0);
+        if ($operatorId <= 0) {
+            return $this->jsonResponse('会话异常', 401, 'error');
+        }
+
+        // 2) 入参
+        $in       = Request::post();
+        $targetId = (int)($in['admin_id'] ?? 0);
+        if ($targetId <= 0) {
+            return $this->jsonResponse('参数错误：admin_id', 422, 'error');
+        }
+
+        // 3) 读取目标账号（存在性检查）
+        /** @var AdminUser|null $target */
+        $target = AdminUser::where('id', $targetId)->find(); // 不加 whereNull('deleted_at')，兼容已软删场景
+        if (!$target) {
+            return $this->jsonResponse('账号不存在', 404, 'error');
+        }
+
+        // 4) 业务限制
+        if ($operatorId === $targetId) {
+            return $this->jsonResponse('不能删除自己', 400, 'error');
+        }
+        if ($this->isSuperAdmin($targetId)) {
+            return $this->jsonResponse('超级管理员不可删除', 403, 'error');
+        }
+
+        // 5) 执行删除（事务）：先解绑角色，再物理删用户
+        try {
+            Db::startTrans();
+
+            // 解除角色绑定
+            AdminUserRole::where('admin_id', $targetId)->delete();
+
+            // （可选但推荐）清理口令历史与登录审计，避免外键/脏数据
+            // 如无外键也可保留审计数据，按需开启：
+             AdminUserPasswordHistory::where('admin_id', $targetId)->delete();
+            // AdminUserLoginAudit::where('admin_id', $targetId)->delete();
+
+            // 物理删除用户记录：使用 Db 层以规避软删除特性
+            Db::name('admin_user')->where('id', $targetId)->delete();
+
+            // （可选）清理与权限相关的缓存，如有对应方法可在此调用：
+            try {
+                PermissionCacheService::invalidateAdmin($targetId);
+            } catch (\Throwable $e) {
+                Log::warning("清理权限缓存失败: {$e->getMessage()}");
+            }
+
+            Db::commit();
+            return $this->jsonResponse('删除成功', 200, 'success');
+        } catch (\Throwable $e) {
+            Db::rollback();
+            Log::error('AdminAuth::deleteAdmin failed: ' . $e->getMessage());
+            return $this->jsonResponse('删除失败，请稍后重试', 500, 'error');
+        }
+    }
+
 }

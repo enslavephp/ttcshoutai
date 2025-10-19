@@ -6,56 +6,85 @@ namespace app\shopadmin\model;
 use think\Model;
 
 /**
- * 权限表（ORM）
+ * 全局权限字典（无 merchant 维度）
  *
- * 字段:
- *  id, merchant_id, code, name, description,
- *  is_system, resource_type, resource_id, action,
- *  created_at, updated_at, version
+ * 表：shopadmin_permission
  *
- * 说明:
- *  - 由 DB 维护时间戳（DEFAULT CURRENT_TIMESTAMP），这里关闭自动时间戳，避免冲突。
+ * @property int         $id
+ * @property string      $code
+ * @property string      $name
+ * @property string|null $description
+ * @property string      $resource_type
+ * @property string|null $resource_id
+ * @property string      $action
+ * @property int         $is_system
+ * @property string      $created_at
+ * @property string      $updated_at
+ * @property int         $version
  */
 class ShopAdminPermission extends Model
 {
+    /** 物理表名 */
     protected $name = 'shopadmin_permission';
+
+    /** 主键 */
     protected $pk   = 'id';
 
-    /** 时间戳交给 DB 维护 */
+    /** 时间戳交由 DB DEFAULT / ON UPDATE 维护 */
     protected $autoWriteTimestamp = false;
 
     /** 字段白名单 */
     protected $field = [
-        'id','merchant_id','code','name','description',
-        'is_system','resource_type','resource_id','action',
-        'created_at','updated_at','version',
+        'id',
+        'code',
+        'name',
+        'description',
+        'resource_type',
+        'resource_id',
+        'action',
+        'is_system',
+        'created_at',
+        'updated_at',
+        'version',
     ];
 
     /** 类型转换 */
     protected $type = [
-        'id'          => 'integer',
-        'merchant_id' => 'integer',
-        'is_system'   => 'integer', // 或 'bool'，看你需要
-        'version'     => 'integer',
-        'created_at'  => 'datetime',
-        'updated_at'  => 'datetime',
-        // resource_id 保持字符串/NULL 语义
+        'id'         => 'integer',
+        'is_system'  => 'integer',
+        'version'    => 'integer',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
     ];
 
-    // ---------- 查询范围 ----------
-    public function scopeOfMerchant($query, int $merchantId)
+    /** 只读字段，避免被业务误改 */
+    protected $readonly = ['is_system'];
+
+    /* ---------- 常用作用域 ---------- */
+
+    /**
+     * 三元组（resource_type, resource_id, action）筛选
+     * - $id === null → resource_id IS NULL
+     * - 否则         → resource_id = $id
+     */
+    public function scopeResource($query, string $type, ?string $id, string $action)
     {
-        $query->where('merchant_id', $merchantId);
+        $query->where('resource_type', $type)->where('action', $action);
+        return $id === null
+            ? $query->whereNull('resource_id')
+            : $query->where('resource_id', $id);
     }
 
+    /** 关键字（code/name/description） */
     public function scopeKeyword($query, $keyword)
     {
         if ($keyword !== '' && $keyword !== null) {
             $kw = '%' . str_replace(['%','_'], ['\%','\_'], (string)$keyword) . '%';
-            $query->whereLike('code|name|description|resource_type|resource_id|action', $kw);
+            $query->whereLike('code|name|description', $kw);
         }
     }
 
+    /** 资源类型 */
     public function scopeResourceType($query, $resourceType)
     {
         if ($resourceType !== '' && $resourceType !== null) {
@@ -64,9 +93,9 @@ class ShopAdminPermission extends Model
     }
 
     /**
-     * 资源ID筛选
-     * - 空串/NULL → resource_id IS NULL
-     * - 其他值   → resource_id = 值
+     * 资源ID：
+     * - ''/null → IS NULL
+     * - 其他     → '='
      */
     public function scopeResourceId($query, $resourceId)
     {
@@ -77,6 +106,7 @@ class ShopAdminPermission extends Model
         }
     }
 
+    /** 动作 */
     public function scopeAction($query, $action)
     {
         if ($action !== '' && $action !== null) {
@@ -84,6 +114,7 @@ class ShopAdminPermission extends Model
         }
     }
 
+    /** 分页 + 排序 */
     public function scopePageAndSort($query, $page, $limit, $sortField = 'id', $sortOrder = 'desc')
     {
         $page  = max(1, (int)$page);

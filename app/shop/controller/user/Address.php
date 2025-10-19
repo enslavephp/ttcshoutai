@@ -1,10 +1,10 @@
 <?php
-
+// File: app/shop/controller/user/Address.php
 namespace app\shop\controller\user;
 
 use app\BaseController;
 use app\shop\validate\AddressValidate;
-use app\shop\model\Address as AddressModel;
+use app\shop\model\UserAddresses as AddressModel;
 use think\facade\Db;
 use think\facade\Log;
 use think\Request;
@@ -12,18 +12,18 @@ use think\Request;
 class Address extends BaseController
 {
     /**
-     * 创建或更新地址
+     * 创建或更新地址（Model 内拼接 POINT，经纬度来自请求）
      */
     public function handleAddress(Request $request, $isUpdate = false)
     {
-        // 获取用户信息
+        // 登录校验
         $user = $request->user ?? null;
         if (!$user || !isset($user['id'])) {
             return $this->jsonResponse('未登录用户，请先登录', 401, 'error');
         }
-        $userId = $user['id'];
+        $userId = (int)$user['id'];
 
-        // 验证输入数据
+        // 参数与校验
         $data = $request->post();
         $validate = new AddressValidate();
         $scene = $isUpdate ? 'update' : 'create';
@@ -31,24 +31,23 @@ class Address extends BaseController
             return $this->jsonResponse($validate->getError(), 422, 'error');
         }
 
-        // 查询待更新的地址
+        // 更新场景：校验记录归属
         $address = null;
         if ($isUpdate) {
-            $address = AddressModel::where('id', $data['id'])->where('user_id', $userId)->find();
+            $address = AddressModel::where('id', (int)$data['id'])->where('user_id', $userId)->find();
             if (!$address) {
                 return $this->jsonResponse('地址不存在', 404, 'error');
             }
         }
 
-        // 处理默认地址逻辑
-        if (isset($data['is_default']) && $data['is_default'] == 1) {
-            $this->setDefaultAddress($userId, $isUpdate ? $data['id'] : null);
+        // 默认地址：若设置为默认，则将其他地址的 is_default 置 0（保持应用层单默认）
+        if (isset($data['is_default']) && (int)$data['is_default'] === 1) {
+            $this->setDefaultAddress($userId, $isUpdate ? (int)$data['id'] : null);
         }
 
-        // 动态构建更新数据
+        // 构建写库数据（不直接写 location；由 Model 事件拼接 POINT(lon,lat)）
         $addressData = $this->buildAddressData($data, $userId);
 
-        // 保存地址
         Db::startTrans();
         try {
             if ($isUpdate) {
@@ -58,7 +57,7 @@ class Address extends BaseController
             }
             Db::commit();
             return $this->jsonResponse($isUpdate ? '地址更新成功' : '地址创建成功', 200, 'success');
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Db::rollback();
             Log::error('保存地址失败', [
                 'error' => $e->getMessage(),
@@ -70,141 +69,128 @@ class Address extends BaseController
     }
 
     /**
-     * 清理并设置默认地址
+     * 清理并设置默认地址（应用层保持单默认；DDL 层允许多个）
      */
-    private function setDefaultAddress($userId, $currentId = null)
+    private function setDefaultAddress(int $userId, ?int $currentId = null): void
     {
-        // 先将其他默认地址设为 0，但保留当前地址为默认
         AddressModel::where('user_id', $userId)
-            ->where('id', '<>', $currentId)
+            ->when($currentId !== null, function ($q) use ($currentId) {
+                $q->where('id', '<>', $currentId);
+            })
             ->update(['is_default' => 0]);
     }
 
     /**
-     * 动态构建地址数据
+     * 过滤和映射字段到 DDL 列
      */
-    private function buildAddressData($data, $userId)
+    private function buildAddressData(array $data, int $userId): array
     {
-        // 经纬度处理
-        $latitude = $data['latitude'] ?? null;
-        $longitude = $data['longitude'] ?? null;
-        $location = null;
+        $latitude  = isset($data['latitude'])  ? (float)$data['latitude']  : null;
+        $longitude = isset($data['longitude']) ? (float)$data['longitude'] : null;
 
-        if ($latitude && $longitude) {
-            $location = Db::raw("ST_GeomFromText('POINT($longitude $latitude)')");
-        }
-
-        // 动态过滤数据，保留有效字段
-        $addressData = array_filter([
+        // 仅保留 DDL 中存在的字段
+        $payload = [
             'user_id'        => $userId,
-            'full_address'   => $data['full_address'] ?? null,
-            'full_address_name' => $data['full_address_name'] ?? null,
-            'address'        => $data['address'] ?? null,
-            'tel'            => $data['tel'] ?? null,
+            // 行政区划
+            'province'       => $data['province']       ?? null,
+            'city'           => $data['city']           ?? null,
+            'district'       => $data['district']       ?? null,
+            // 详细地址
+            'street_address' => $data['street_address'] ?? null,
+            'address_line'   => $data['address_line']   ?? null,
+            // 联系方式
             'recipient_name' => $data['recipient_name'] ?? null,
-            'is_default'     => $data['is_default'] ?? 0,
+            'tel'            => $data['tel']            ?? null,
+            'zipcode'        => $data['zipcode']        ?? null,
+            // 默认标记
+            'is_default'     => isset($data['is_default']) ? (int)$data['is_default'] : 0,
+            // 经纬度（location 由模型事件自动生成）
             'latitude'       => $latitude,
             'longitude'      => $longitude,
-            'location'       => $location,
-        ], fn($value) => $value !== null);
+        ];
 
-        return $addressData;
+        // 仅过滤掉 null，保留 0 或空字符串
+        return array_filter($payload, static function ($v) { return $v !== null; });
     }
 
-
-
-    /**
-     * 创建地址
-     */
+    /** 创建地址 */
     public function createAddress(Request $request)
     {
         return $this->handleAddress($request, false);
     }
 
-    /**
-     * 更新地址
-     */
+    /** 更新地址 */
     public function updateAddress(Request $request)
     {
         return $this->handleAddress($request, true);
     }
-    /**
-     * 删除地址
-     */
+
+    /** 删除地址（物理删除） */
     public function deleteAddress(Request $request)
     {
-        // 获取用户信息
         $user = $request->user ?? null;
         if (!$user || !isset($user['id'])) {
             return $this->jsonResponse('未登录用户，请先登录', 401, 'error');
         }
-        $userId = $user['id'];
+        $userId = (int)$user['id'];
 
-        // 获取地址ID
         $addressIds = $request->post('address_ids');
-
         if (empty($addressIds) || !is_array($addressIds)) {
             return $this->jsonResponse('地址ID不能为空或格式错误', 400, 'error');
         }
 
-        // 查找地址记录
-        $addresses = AddressModel::whereIn('id', $addressIds)
-            ->where('user_id', $userId)
-            ->select();
-
+        $addresses = AddressModel::whereIn('id', $addressIds)->where('user_id', $userId)->select();
         if ($addresses->isEmpty()) {
             return $this->jsonResponse('地址不存在或没有权限删除', 404, 'error');
         }
 
-        // 检查是否有默认地址被删除
         $defaultAddressDeleted = false;
-        foreach ($addresses as $address) {
-            if ($address->is_default) {
-                $defaultAddressDeleted = true;
-                break;
-            }
+        foreach ($addresses as $addr) {
+            if ((int)$addr->is_default === 1) { $defaultAddressDeleted = true; break; }
         }
 
         Db::startTrans();
         try {
-            // 批量删除地址
             AddressModel::whereIn('id', $addressIds)->where('user_id', $userId)->delete();
 
-            // 如果删除了默认地址，设置新的默认地址
             if ($defaultAddressDeleted) {
-                AddressModel::where('user_id', $userId)
-                    ->whereNotIn('id', $addressIds)
-                    ->limit(1)
-                    ->update(['is_default' => 1]);
+                // 将剩余中最新的一条置为默认
+                $newDefault = AddressModel::where('user_id', $userId)
+                    ->order(['updated_at' => 'desc', 'id' => 'desc'])
+                    ->find();
+                if ($newDefault) {
+                    $newDefault->is_default = 1;
+                    $newDefault->save();
+                }
             }
 
             Db::commit();
             return $this->jsonResponse('地址删除成功', 200, 'success');
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Db::rollback();
             Log::error('地址删除失败', ['error' => $e->getMessage()]);
             return $this->jsonResponse('地址删除失败: ' . $e->getMessage(), 500, 'error');
         }
     }
-    /**
-     * 获取当前用户的所有地址
-     */
+
+    /** 获取当前用户的所有地址（默认优先，时间倒序） */
     public function getUserAddresses(Request $request)
     {
-        // 获取用户信息
         $user = $request->user ?? null;
         if (!$user || !isset($user['id'])) {
             return $this->jsonResponse('未登录用户，请先登录', 401, 'error');
         }
-        $userId = $user['id'];
+        $userId = (int)$user['id'];
 
         try {
-            // 查询当前用户的所有地址
             $addresses = AddressModel::where('user_id', $userId)
-                ->order('is_default', 'desc') // 默认地址排在最前
+                ->field('id,user_id,province,city,district,street_address,address_line,recipient_name,tel,zipcode,is_default,latitude,longitude,created_at,updated_at,ST_AsText(location) AS location_wkt')
+                ->order(['is_default' => 'desc', 'updated_at' => 'desc', 'id' => 'desc'])
                 ->select()->toArray();
+// 前端用 location_wkt，如 "POINT(121.4737 31.2304)"
+
             return $this->jsonResponse('获取地址成功', 200, 'success', $addresses);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return $this->jsonResponse('获取地址失败: ' . $e->getMessage(), 500, 'error');
         }
     }

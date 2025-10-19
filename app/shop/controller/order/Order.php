@@ -3,7 +3,7 @@
 namespace app\shop\controller\order;
 
 use app\BaseController;
-use app\shop\model\Address;
+use app\shop\model\UserAddresses;
 use app\shop\model\Order as OrderModel;
 use app\shop\model\OrderItem;
 use app\shop\model\Cart;
@@ -49,7 +49,7 @@ class Order extends BaseController
                 return $this->jsonResponse('地址 ID 不能为空', 400, 'error');
             }
             // 获取用户选择的地址
-            $userAddress = Address::where('id', $addressId)
+            $userAddress = UserAddresses::where('id', $addressId)
                 ->where('user_id', $userId)
                 ->find();
             if (!$userAddress) {

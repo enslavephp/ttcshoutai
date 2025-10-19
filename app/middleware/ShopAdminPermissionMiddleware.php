@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace app\middleware;
 
+
 use Closure;
 use think\facade\Cache;
 use app\common\service\TokenService;
@@ -21,7 +22,7 @@ use app\shopadmin\model\ShopAdminUserRole;
  * 要点：
  * 1) 路由权限声明可选；若未声明且 `permission.enforce_all=true`，则将当前路径点号化为权限码
  *    （/shopadmin/role/assign → shopadmin.role.assign）并校验；若在白名单 `permission.allow_routes` 则放行。
- * 2) 超管直通：本商户内拥有 `permission.super_admin_code`（默认 super_shopadmin）的账号。
+ * 2) 超管直通：本商户内拥有 `permission.super_shop_admin_code`（默认 super_shopadmin）的账号。
  * 3) 权限集合优先缓存（key 前缀取自 `permission.prefix`，与 PermissionCacheService 一致），未命中回源。
  * 4) ALL 模式：声明的权限码必须全部具备；命中缓存仍缺时会强刷一次再判定（双检）。
  */
@@ -32,10 +33,14 @@ class ShopAdminPermissionMiddleware
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
     }
 
@@ -54,9 +59,9 @@ class ShopAdminPermissionMiddleware
         }
 
         // 行为开关
-        $enforceAll  = (bool)(config('permission.enforce_all') ?? true);
-        $allowRoutes = (array)(config('permission.allow_routes') ?? []);
-        $superCode   = (string)(config('permission.super_admin_code') ?? 'super_shopadmin');
+        $enforceAll  = (bool)(\app\common\Helper::getValue('permission.enforce_all') ?? true);
+        $allowRoutes = (array)(\app\common\Helper::getValue('permission.allow_routes') ?? []);
+        $superCode   = (string)(\app\common\Helper::getValue('permission.super_shop_admin_code') ?? 'super_shopadmin');
 
         // 1) 解析 Token（要求 realm=shopadmin，且带 merchant_id / user_id）
         $auth = (string)($request->header('Authorization') ?? '');
@@ -74,6 +79,7 @@ class ShopAdminPermissionMiddleware
         }
         $adminId    = (int)($claims->user_id ?? 0);
         $merchantId = (int)($claims->merchant_id ?? 0);
+
         if ($adminId <= 0 || $merchantId <= 0) {
             return $this->deny('会话异常（缺少租户/用户标识）', 401);
         }
@@ -100,7 +106,7 @@ class ShopAdminPermissionMiddleware
         // 4) 这些权限码必须在权限表中存在（避免路由写错/未配置）
         $invalid = $this->nonexistentPermCodes($required);
         if (!empty($invalid)) {
-            if ((bool)(config('permission.auto_register_missing') ?? false)) {
+            if ((bool)(\app\common\Helper::getValue('permission.auto_register_missing') ?? false)) {
                 // 如果你确实要自动注册缺失权限，可在这里放开（注意 shopadmin_permission 的字段约束）
                 // foreach ($invalid as $code) {
                 //     ShopAdminPermission::create([
@@ -193,7 +199,7 @@ class ShopAdminPermissionMiddleware
      */
     private function loadAdminPermSet(int $adminId, bool $forceRefresh = false): array
     {
-        $key = (string)(config('permission.prefix') ?? 'admin:perms:') . $adminId;
+        $key = (string)(\app\common\Helper::getValue('permission.prefix') ?? 'admin:perms:') . $adminId;
 
         if ($forceRefresh) {
             Cache::delete($key);

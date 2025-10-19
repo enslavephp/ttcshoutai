@@ -31,10 +31,14 @@ class Confirm extends BaseController
     private function tokenSvc(): TokenService
     {
         if ($this->tokenService === null) {
+            // 初始化 TokenService 用于生成和验证 JWT token
+            $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+            $jwtCfg['secret'] = $jwtSecret;
+
             $this->tokenService = new TokenService(
                 new CacheFacadeAdapter(),
                 new SystemClock(),
-                config('jwt') ?: []
+                $jwtCfg
             );
         }
         return $this->tokenService;

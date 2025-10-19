@@ -3,7 +3,9 @@ declare(strict_types=1);
 
 namespace app\shopadmin\controller\rbac;
 
+use app\admin\model\ShopAdminMerchant;
 use app\BaseController;
+
 use think\facade\Request;
 use think\facade\Db;
 use think\facade\Cache;
@@ -15,10 +17,13 @@ use app\common\service\TokenService;
 use app\common\infra\CacheFacadeAdapter;
 use app\common\service\PermissionCacheService;
 
+
 use app\shopadmin\model\ShopAdminRole;
+use app\shopadmin\model\ShopAdminUser;
 use app\shopadmin\model\ShopAdminUserRole;
 use app\shopadmin\model\ShopAdminPermission;
 use app\shopadmin\model\ShopAdminRolePermission;
+use think\route\dispatch\Controller;
 
 /**
  * 【商户侧】角色管理控制器（RBAC, Tenant-aware）
@@ -28,6 +33,10 @@ use app\shopadmin\model\ShopAdminRolePermission;
  * - 超管直通：持 super_shopadmin（本租户）则不受等级限制
  * - 等级比较：基于“最高权限等级”（bestRoleLevel），支持 asc/desc 两种排序语义
  * - 缓存一致性：角色/授权变更后失效本租户受影响账号的权限缓存
+ *
+ * 说明：
+ * - 登录校验、权限判断、二次确认均由路由中间件处理（ShopAdminToken/Permission/SensitiveOperation），
+ *   控制器内部仍需获取 merchant_id / admin_id 用于业务判断。
  */
 class Role extends BaseController
 {
@@ -36,10 +45,14 @@ class Role extends BaseController
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
     }
 
@@ -76,7 +89,7 @@ class Role extends BaseController
     /** 等级排序方向：asc=数字越小权限越高；desc=数字越大权限越高 */
     private function levelOrder(): string
     {
-        $order = (string)(config('permission.level_order') ?? 'asc');
+        $order = (string) (\app\common\Helper::getValue('permission.level_order') ?? 'asc');
         return ($order === 'desc') ? 'desc' : 'asc';
     }
 
@@ -135,7 +148,7 @@ class Role extends BaseController
                 return;
             }
         } catch (\Throwable $e) {}
-        $prefix = (string)(config('permission.prefix') ?? 'shopadmin:perms:');
+        $prefix = (string)(\app\common\Helper::getValue('permission.prefix') ?? 'shopadmin:perms:');
         Cache::delete($prefix . $adminId);
     }
 
@@ -243,91 +256,135 @@ class Role extends BaseController
 
         return $this->jsonResponse('创建成功', 200, 'success', ['role_id' => (int)$role->id]);
     }
-
-    /** 更新角色（仅同租户；系统内置 super_shopadmin 受保护不可停用/删除/改 code/level） */
     public function update()
     {
         [$merchantId, $operatorId, $err] = $this->requireShopAdminAuth(); if ($err) return $err;
+        if ($err) return $err;
 
-        $data = Request::post();
-        $rules = [
-            'id'          => 'require|integer',
-            'code'        => 'alphaDash|max:64',
-            'name'        => 'max:64',
-            'description' => 'max:255',
-            'status'      => 'in:0,1',
-            'level'       => 'integer|between:1,65535',
-            'valid_from'  => 'date',
-            'valid_to'    => 'date',
-        ];
-        $validate = Validate::rule($rules);
-        if (!$validate->check($data)) return $this->jsonResponse($validate->getError(), 422, 'error');
+        $in = Request::post();
+        $roleId = (int)($in['role_id'] ?? 0);
+        if ($roleId <= 0) return $this->jsonResponse('缺少 role_id', 422, 'error');
 
         /** @var ShopAdminRole|null $role */
-        $role = ShopAdminRole::where('merchant_id',$merchantId)->where('id',(int)$data['id'])->find();
+        $role = ShopAdminRole::where('id', $roleId)->where('merchant_id', $merchantId)->find();
         if (!$role) return $this->jsonResponse('角色不存在', 404, 'error');
 
-        $isSuperRole = ((string)$role->getAttr('code') === $this->SUPER_CODE);
+        $isBuiltIn = (string)$role->getAttr('code') === 'super_shopadmin';
+        $changed   = [];
 
-        // 越权（对角色目标本身）
-        if ($resp = $this->assertCanOperateRole($merchantId, $operatorId, (int)$role->id)) {
-            // 超管可改超管角色的名称/描述/有效期，但禁止改 code/level/停用
-            if (!$this->isSuperAdmin($merchantId, $operatorId)) return $resp;
-        }
-
-        // 赋值（仅对传参字段）
-        $set = function(string $k) use (&$data, $role, $isSuperRole) {
-            if (!array_key_exists($k, $data)) return;
-            $val = $data[$k];
-
-            if (in_array($k,['code','name','description'],true)) $val = $this->normText((string)$val);
-            if (in_array($k,['status','level'],true)) $val = (int)$val;
-
-            // 保护：super_shopadmin 禁止改 code/level/停用
-            if ($isSuperRole && in_array($k, ['code','level','status'], true)) {
-                return; // 忽略这些字段
-            }
-            $role->setAttr($k, $val);
-        };
-        foreach (['code','name','description','status','level','valid_from','valid_to'] as $f) $set($f);
-
-        $changed = $role->getChangedData();
-        if (empty($changed)) return $this->jsonResponse('没有需要更新的字段', 400, 'error');
-
-        // 本租户内唯一性
-        if (array_key_exists('code',$changed)) {
-            $dup = ShopAdminRole::where('merchant_id',$merchantId)->where('code',$changed['code'])->where('id','<>',$role->id)->find();
-            if ($dup) return $this->jsonResponse('角色代码已存在', 400, 'error');
-        }
-        if (array_key_exists('name',$changed)) {
-            $dup = ShopAdminRole::where('merchant_id',$merchantId)->where('name',$changed['name'])->where('id','<>',$role->id)->find();
-            if ($dup) return $this->jsonResponse('角色名称已存在', 400, 'error');
-        }
-
-        // 等级越权（当 level 变化且不是超管直通）
-        if (array_key_exists('level',$changed) && !$this->isSuperAdmin($merchantId, $operatorId)) {
-            $opBest = $this->bestRoleLevelOfAdmin($merchantId, $operatorId);
-            if (!$this->isSuperior($opBest, (int)$changed['level'])) {
-                return $this->jsonResponse('越权：不能把角色等级改成不低于你的等级', 403, 'error');
+        // code（仅非内置可改；同租户唯一；传了才处理）
+        if (array_key_exists('code', $in)) {
+            if ($isBuiltIn) return $this->jsonResponse('内置角色禁止修改 code', 403, 'error');
+            $new = strtolower(trim((string)$in['code']));
+            if ($new === '') return $this->jsonResponse('code 不能为空', 422, 'error');
+            if ($new !== (string)$role->getAttr('code')) {
+                $dup = ShopAdminRole::where('merchant_id',$merchantId)->where('code',$new)->where('id','<>',$roleId)->find();
+                if ($dup) return $this->jsonResponse('code 已存在（当前商户）', 409, 'error');
+                $role->setAttr('code', $new);
+                $changed[] = 'code';
             }
         }
 
-        // 有效期顺序校验
-        $vf = array_key_exists('valid_from',$changed) ? $changed['valid_from'] : $role->getOrigin('valid_from');
-        $vt = array_key_exists('valid_to',$changed)   ? $changed['valid_to']   : $role->getOrigin('valid_to');
-        if ($vf && $vt && strtotime((string)$vf) >= strtotime((string)$vt)) {
+        // name（传了且变化才改）
+        if (array_key_exists('name', $in)) {
+            $new = trim((string)$in['name']);
+            if ($new === '') return $this->jsonResponse('name 不能为空', 422, 'error');
+            if ($new !== (string)$role->getAttr('name')) {
+                $role->setAttr('name', $new);
+                $changed[] = 'name';
+            }
+        }
+
+        // level（仅非内置可改）
+        if (array_key_exists('level', $in)) {
+            if ($isBuiltIn) return $this->jsonResponse('内置角色禁止修改 level', 403, 'error');
+            $new = (int)$in['level'];
+            if ($new !== (int)$role->getAttr('level')) {
+                $role->setAttr('level', $new);
+                $changed[] = 'level';
+            }
+        }
+
+        // status（仅非内置可改）
+        if (array_key_exists('status', $in)) {
+            if ($isBuiltIn) return $this->jsonResponse('内置角色禁止修改 status', 403, 'error');
+            $sv = (int)$in['status'];
+            if (!in_array($sv, [0,1], true)) return $this->jsonResponse('status 仅允许 0 或 1', 422, 'error');
+            if ($sv !== (int)$role->getAttr('status')) {
+                $role->setAttr('status', $sv);
+                $changed[] = 'status';
+            }
+        }
+
+        // 备注/描述（可选）
+        if (array_key_exists('remark', $in)) {
+            $new = trim((string)$in['remark']);
+            if ($new !== (string)$role->getAttr('remark')) {
+                $role->setAttr('remark', $new);
+                $changed[] = 'remark';
+            }
+        }
+        if (array_key_exists('description', $in)) {
+            $new = trim((string)$in['description']);
+            if ($new !== (string)$role->getAttr('description')) {
+                $role->setAttr('description', $new);
+                $changed[] = 'description';
+            }
+        }
+
+        // 有效期（传了才处理；空串=>NULL；最终区间校验）
+        $vfProvided = array_key_exists('valid_from', $in);
+        $vtProvided = array_key_exists('valid_to',   $in);
+
+        $newVf = $role->getAttr('valid_from');
+        $newVt = $role->getAttr('valid_to');
+
+        if ($vfProvided) {
+            $vfRaw = $in['valid_from'];
+            if (is_string($vfRaw) && trim($vfRaw)==='') $vfRaw = null;
+            $vf = $this->normalizeDT($vfRaw);
+            if ($vf === '__INVALID__') return $this->jsonResponse('valid_from 时间格式不正确', 422, 'error');
+            if ($vf !== ($newVf ? date('Y-m-d H:i:s', strtotime((string)$newVf)) : null)) {
+                $newVf = $vf;
+                $role->setAttr('valid_from', $newVf);
+                $changed[] = 'valid_from';
+            }
+        }
+        if ($vtProvided) {
+            $vtRaw = $in['valid_to'];
+            if (is_string($vtRaw) && trim($vtRaw)==='') $vtRaw = null;
+            $vt = $this->normalizeDT($vtRaw);
+            if ($vt === '__INVALID__') return $this->jsonResponse('valid_to 时间格式不正确', 422, 'error');
+            if ($vt !== ($newVt ? date('Y-m-d H:i:s', strtotime((string)$newVt)) : null)) {
+                $newVt = $vt;
+                $role->setAttr('valid_to', $newVt);
+                $changed[] = 'valid_to';
+            }
+        }
+
+        // 区间校验：用“修改后的最终值”
+        if ($newVf && $newVt && strtotime((string)$newVf) >= strtotime((string)$newVt)) {
             return $this->jsonResponse('有效期起始必须早于结束', 400, 'error');
         }
 
-        $role->save();
-
-        // 角色启停/有效期变更 → 失效绑定该角色的账号权限缓存
-        if (array_intersect(['status','valid_from','valid_to','level'], array_keys($changed))) {
-            $this->invalidateAdminsByRoleId($merchantId, (int)$role->id);
+        if (!$changed) {
+            return $this->jsonResponse('无变更', 200, 'success');
         }
 
-        return $this->jsonResponse('更新成功', 200, 'success');
+        // 审计字段
+        $role->setAttr('updated_at', date('Y-m-d H:i:s'));
+        $role->setAttr('updated_by', $operatorId);
+
+        try {
+            $role->save(); // 只会更新被修改过的字段
+            return $this->jsonResponse('更新成功', 200, 'success', ['changed_fields' => $changed]);
+        } catch (\Throwable $e) {
+            Log::error('Role.update(save) failed: ' . $e->getMessage());
+            return $this->jsonResponse('更新失败，请稍后重试', 500, 'error');
+        }
     }
+
+
 
     /** 删除角色（仅同租户；未解绑用户/权限前不允许；super_shopadmin 禁止删除） */
     public function delete()
@@ -447,46 +504,74 @@ class Role extends BaseController
     {
         [$merchantId, $operatorId, $err] = $this->requireShopAdminAuth(); if ($err) return $err;
 
-        $adminId = (int)(Request::post('admin_id') ?? 0);
-        $roleId  = (int)(Request::post('role_id')  ?? 0);
-        $vf = Request::post('valid_from') ?: null;
-        $vt = Request::post('valid_to')   ?: null;
+        $in      = Request::post();
+        $adminId = (int)($in['admin_id'] ?? 0);
+        $roleId  = (int)($in['role_id']  ?? 0);
+
+        // 解析有效期：区分【未传】与【传了空串=清空】
+        $parseDT = function(array $src, string $key): array {
+            if (!array_key_exists($key, $src)) return ['present' => false, 'value' => null];
+            $raw = $src[$key];
+            if ($raw === '' || $raw === null) return ['present' => true, 'value' => null]; // 显式清空
+            $ts = strtotime((string)$raw);
+            if ($ts === false) return ['present' => true, 'value' => '__INVALID__'];
+            return ['present' => true, 'value' => date('Y-m-d H:i:s', $ts)];
+        };
+        $vfIn = $parseDT($in, 'valid_from');
+        $vtIn = $parseDT($in, 'valid_to');
 
         if ($adminId<=0 || $roleId<=0) return $this->jsonResponse('缺少 admin_id 或 role_id', 400, 'error');
+        if (($vfIn['present'] && $vfIn['value']==='__INVALID__') || ($vtIn['present'] && $vtIn['value']==='__INVALID__')) {
+            return $this->jsonResponse('valid_from/valid_to 时间格式不正确', 422, 'error');
+        }
 
         // 越权校验（对账号与角色）
         if ($resp = $this->assertCanOperateUser($merchantId, $operatorId, $adminId)) return $resp;
         if ($resp = $this->assertCanOperateRole($merchantId, $operatorId, $roleId))  return $resp;
 
-        // 归属校验
-        $userOk = Db::table('shopadmin_user')->where(['id'=>$adminId,'merchant_id'=>$merchantId])->whereNull('deleted_at')->find();
+        // 归属校验（ORM）
+        $userOk = ShopAdminUser::whereNull('deleted_at')->where(['id'=>$adminId,'merchant_id'=>$merchantId])->find();
         if (!$userOk) return $this->jsonResponse('账号不存在', 404, 'error');
 
         $roleOk = ShopAdminRole::where(['id'=>$roleId,'merchant_id'=>$merchantId])->find();
         if (!$roleOk) return $this->jsonResponse('角色不存在', 404, 'error');
 
-        if ($vf && $vt && strtotime($vf) >= strtotime($vt))
-            return $this->jsonResponse('有效期起始必须早于结束', 400, 'error');
+        // 如果两端都“有传且非空”，则做区间顺序校验
+        if ($vfIn['present'] && $vtIn['present'] && $vfIn['value'] !== null && $vtIn['value'] !== null) {
+            if (strtotime($vfIn['value']) >= strtotime($vtIn['value'])) {
+                return $this->jsonResponse('有效期起始必须早于结束', 400, 'error');
+            }
+        }
 
         // 幂等 upsert
-        $now = date('Y-m-d H:i:s');
-        $exists = ShopAdminUserRole::where(['merchant_id'=>$merchantId,'admin_id'=>$adminId,'role_id'=>$roleId])->find();
+        $now    = date('Y-m-d H:i:s');
+        $exists = ShopAdminUserRole::where([
+            'merchant_id'=>$merchantId,'admin_id'=>$adminId,'role_id'=>$roleId
+        ])->find();
+
         if ($exists) {
-            ShopAdminUserRole::where(['merchant_id'=>$merchantId,'admin_id'=>$adminId,'role_id'=>$roleId])
-                ->update([
-                    'valid_from' => $vf ?: $exists->getAttr('valid_from'),
-                    'valid_to'   => $vt ?: $exists->getAttr('valid_to'),
-                    'assigned_by'=> $operatorId,
-                ]);
+            // 仅当调用方“传了该字段”才更新；支持清空（NULL）
+            $upd = [
+                'assigned_by' => $operatorId,
+                'assigned_at' => $now,
+            ];
+            if ($vfIn['present']) $upd['valid_from'] = $vfIn['value']; // 允许 null
+            if ($vtIn['present']) $upd['valid_to']   = $vtIn['value']; // 允许 null
+
+            // 只有 assigned_by/assigned_at 也可以更新，保持“最近一次分配者&时间”
+            ShopAdminUserRole::where([
+                'merchant_id'=>$merchantId,'admin_id'=>$adminId,'role_id'=>$roleId
+            ])->update($upd);
         } else {
-            Db::name('shopadmin_user_role')->insert([
+            // 新建：未传 valid_from 则默认 now；未传 valid_to 则默认 NULL
+            ShopAdminUserRole::insert([
                 'admin_id'    => $adminId,
                 'role_id'     => $roleId,
                 'merchant_id' => $merchantId,
                 'assigned_at' => $now,
                 'assigned_by' => $operatorId,
-                'valid_from'  => $vf ?: $now,
-                'valid_to'    => $vt ?: null,
+                'valid_from'  => $vfIn['present'] ? $vfIn['value'] : $now,
+                'valid_to'    => $vtIn['present'] ? $vtIn['value'] : null,
             ]);
         }
 
@@ -526,8 +611,8 @@ class Role extends BaseController
         if ($resp = $this->assertCanOperateRole($merchantId, $operatorId, $roleId)) return $resp;
 
         $permIds = array_values(array_unique(array_map('intval',$permIds)));
-        // 仅保留本租户的有效权限
-        $exists  = ShopAdminPermission::where('merchant_id',$merchantId)->whereIn('id',$permIds)->column('id');
+        // ✅ 全局权限字典校验（shopadmin_permission 无 merchant_id 维度）
+        $exists  = ShopAdminPermission::whereIn('id',$permIds)->column('id');
         $exists  = array_map('intval',$exists);
         if (!$exists) return $this->jsonResponse('无有效的权限ID', 400, 'error');
 
@@ -594,6 +679,8 @@ class Role extends BaseController
         return $this->jsonResponse('已撤销所有用户分配', 200, 'success');
     }
 
+
+
     /** 一键解绑该角色的所有权限（同租户；变更后失效缓存） */
     public function unbindAllPermissionsOfRole()
     {
@@ -606,5 +693,100 @@ class Role extends BaseController
         ShopAdminRolePermission::where(['merchant_id'=>$merchantId,'role_id'=>$roleId])->delete();
         $this->invalidateAdminsByRoleId($merchantId, $roleId);
         return $this->jsonResponse('已解绑所有权限', 200, 'success');
+    }
+
+    /**
+     * @return \Elastic\Elasticsearch\Client
+     */
+
+
+//    这个文件在\app\admin\controller\shopadmin\Permission里面也有。要改一起改
+    public function merchantPermissions()
+    {
+        $data = Request::post();
+        $rules = [
+            'merchant_id'   => 'require|integer',
+            'page'          => 'integer|min:1',
+            'limit'         => 'integer|min:1|max:100',
+            'keyword'       => 'max:128',
+            'resource_type' => 'max:32',
+            'resource_id'   => 'max:128',
+            'action'        => 'max:32',
+            'ids_only'      => 'in:0,1',
+        ];
+        $validate = Validate::rule($rules);
+        if (!$validate->check($data)) {
+            return $this->jsonResponse($validate->getError() ?: '参数校验失败', 422, 'error');
+        }
+
+        $merchantId = (int)$data['merchant_id'];
+        $page   = max(1, (int)($data['page']  ?? 1));
+        $limit  = min(100, max(1, (int)($data['limit'] ?? 20)));
+        $kw     = trim((string)($data['keyword'] ?? ''));
+        $rtype  = trim((string)($data['resource_type'] ?? ''));
+        $ridRaw = $data['resource_id'] ?? null;
+        $action = trim((string)($data['action'] ?? ''));
+        $idsOnly= (int)($data['ids_only'] ?? 0) === 1;
+
+        // 1) 商户存在
+        $merchant = ShopAdminMerchant::find($merchantId);
+        if (!$merchant) return $this->jsonResponse('商户不存在', 404, 'error');
+
+        // 2) 取 super_shopadmin 角色
+        $role = ShopAdminRole::where('merchant_id', $merchantId)
+            ->where('code', 'super_shopadmin')
+            ->find();
+        if (!$role) {
+            return $this->jsonResponse('未找到该商户的 super_shopadmin 角色', 404, 'error');
+        }
+        $roleId = (int)$role['id'];
+
+        // 3) 组装查询
+        $q = ShopAdminPermission::alias('p')
+            ->join(['shopadmin_role_permission' => 'rp'], 'rp.permission_id = p.id')
+            ->where('rp.merchant_id', $merchantId)
+            ->where('rp.role_id', $roleId);
+
+        if ($kw !== '')    $q->whereLike('p.name|p.code|p.description', "%{$kw}%");
+        if ($rtype !== '') $q->where('p.resource_type', $rtype);
+        if ($action !== '')$q->where('p.action', $action);
+
+        if ($ridRaw !== null) {
+            // 空串 -> 视为 NULL
+            $rid = $this->normText((string)$ridRaw);
+            if ($rid === '') {
+                $q->whereNull('p.resource_id');
+            } else {
+                $q->where('p.resource_id', $rid);
+            }
+        }
+
+        if ($idsOnly) {
+            // 仅返回 ID 数组
+            $ids = $q->distinct(true)->column('p.id');
+            $ids = array_map('intval', $ids);
+            return $this->jsonResponse('OK', 200, 'success', ['permission_ids' => $ids]);
+        }
+
+        $countQ = clone $q;
+        $total  = (int)$countQ->distinct(true)->count('p.id');
+
+        $rows = $q->field([
+            'p.id','p.code','p.name','p.description',
+            'p.resource_type','p.resource_id','p.action',
+            'p.is_system','p.created_at','p.updated_at','p.version',
+            'rp.assigned_at' // 返回分配时间，方便前端展示
+        ])
+            ->order('rp.assigned_at', 'desc')
+            ->page($page, $limit)
+            ->select()
+            ->toArray();
+
+        return $this->jsonResponse('OK', 200, 'success', [
+            'list'  => $rows,
+            'total' => $total,
+            'page'  => $page,
+            'limit' => $limit,
+        ]);
     }
 }

@@ -29,6 +29,10 @@ Route::group('auth', function () {
     Route::post('password/change', 'auth.AdminAuth/changePassword')
         ->middleware(AdminTokenMiddleware::class)
         ->middleware(AdminPermissionMiddleware::class, 'admin.auth.password.change');
+    // 修改密码：需要 Token + 权限 admin.auth.password.change
+    Route::post('deleteAdmin', 'auth.AdminAuth/deleteAdmin')
+        ->middleware(AdminTokenMiddleware::class)
+        ->middleware(AdminPermissionMiddleware::class, 'admin.auth.deleteAdmin');
 });
 
 /**
@@ -71,6 +75,8 @@ Route::group('role', function () {
     Route::post('revokeAllUsersOfRole', 'admin/rbac.Role/revokeAllUsersOfRole')
         ->middleware(AdminPermissionMiddleware::class, 'admin.role.update');
 
+    Route::post('AdminUserhasrole', 'rbac.Role/AdminUserhasrole')
+        ->middleware(AdminPermissionMiddleware::class, 'shopadmin.role.AdminUserhasrole');
 })->middleware(AdminTokenMiddleware::class);
 
 /**
@@ -103,6 +109,34 @@ Route::group('permission', function () {
         ->middleware(AdminPermissionMiddleware::class, 'admin.permission.read');
 
     Route::post('list', 'admin/rbac.Permission/list')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.read');
+})->middleware(AdminTokenMiddleware::class);
+Route::group('shopadmin/permission', function () {
+    Route::post('create', 'admin/shopadmin.Permission/create')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.create');
+
+    Route::post('update', 'admin/shopadmin.Permission/update')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.update');
+
+    Route::post('delete', 'admin/shopadmin.Permission/delete')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.delete')
+        ->middleware(AdminSensitiveOperationMiddleware::class, 'PERMISSION_DELETE');
+
+    Route::post('info', 'admin/shopadmin.Permission/info')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.read');
+
+    Route::post('list', 'admin/shopadmin.Permission/list')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.read');
+
+    Route::post('unbindPermission', 'admin/shopadmin.Permission/unbindPermission')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.role.unbindPermission');
+
+    // 覆盖同步权限到该商户的 super_shopadmin 角色（由后台管理员执行）
+    Route::post('grant', 'admin/shopadmin.Permission/assignToSuperAdmin')
+        ->middleware(AdminPermissionMiddleware::class, 'admin.permission.grant');
+
+    // ...已有路由
+    Route::post('merchant-perms', 'admin/shopadmin.Permission/merchantPermissions')
         ->middleware(AdminPermissionMiddleware::class, 'admin.permission.read');
 })->middleware(AdminTokenMiddleware::class);
 
@@ -171,3 +205,9 @@ Route::group('region', function () {
         ->middleware(AdminSensitiveOperationMiddleware::class, 'REGION_CACHE_CLEAR');
 
 });
+
+// 管理端配置读写
+Route::group('admin/config', function () {
+    Route::get('get',  'admin.Config/get');
+    Route::post('set', 'admin.Config/set');
+})->middleware(AdminTokenMiddleware::class);

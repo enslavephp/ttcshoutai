@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace app\middleware;
 
+
 use Closure;
 use think\facade\Cache;
 use app\common\service\TokenService;
@@ -12,20 +13,11 @@ use app\common\service\PermissionCacheService;
 use app\admin\model\AdminPermission;
 use app\admin\model\AdminUserRole;
 
+
 /**
  * AdminPermissionMiddleware
  *
  * 基于“管理员 → 权限代码集合”的缓存进行接口权限校验。
- *
- * 设计要点：
- * 1) 路由权限声明可选。如果未显式传入权限码且配置 `permission.enforce_all=true`，
- *    则自动把当前请求路径点号化为权限码（例如 /admin/role/create → admin.role.create）进行校验；
- *    若该自动推导的权限码在白名单 `permission.allow_routes` 中则放行。
- * 2) 超管（`permission.super_admin_code` 指定的角色 code）直通。
- * 3) 权限集合优先走缓存（key 前缀取自 `permission.prefix`，与 PermissionCacheService 一致），
- *    未命中则由 PermissionCacheService 回源并写入缓存。
- * 4) 校验模式为 ALL：需要的权限码必须全部具备。保留“双检”逻辑（缓存命中但边界失效时再强刷一次）。
- * 5) 全面使用 ORM（不使用 Db::name），与既有 Model/Service 保持一致。
  */
 class AdminPermissionMiddleware
 {
@@ -34,10 +26,14 @@ class AdminPermissionMiddleware
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
     }
 
@@ -46,7 +42,7 @@ class AdminPermissionMiddleware
      *
      * @param \think\Request $request
      * @param Closure $next
-     * @param mixed ...$requiredCodes  可变参数：路由上声明的权限码列表（ALL 模式）
+     * @param mixed ...$requiredCodes  可变参数：路由声明的权限码列表（ALL 模式）
      */
     public function handle($request, Closure $next, ...$requiredCodes)
     {
@@ -55,28 +51,40 @@ class AdminPermissionMiddleware
             return $next($request);
         }
 
-        // 行为开关
-        $enforceAll  = (bool)(config('permission.enforce_all') ?? true);
-        $allowRoutes = (array)(config('permission.allow_routes') ?? []);
-        $superCode   = (string)(config('permission.super_admin_code') ?? 'super_admin');
+        // 读取配置
+        $enforceAll  = (bool)(\app\common\Helper::getValue('permission.enforce_all') ?? true);
+        $allowRoutes = (array)(\app\common\Helper::getValue('permission.allow_routes') ?? []);
+        $superCode   = (string)(\app\common\Helper::getValue('permission.super_admin_code') ?? 'super_admin');
+        $prefix      = (string)(\app\common\Helper::getValue('permission.prefix') ?? 'admin:perms:');
 
-        // 1) 解析 Token（要求 realm=admin）
-        $auth = (string)($request->header('Authorization') ?? '');
-        $raw  = (stripos($auth, 'Bearer ') === 0) ? substr($auth, 7) : '';
-        if ($raw === '') {
-            return $this->deny('未登录', 401);
-        }
-        try {
-            $claims = $this->tokenService->parse($raw);
-        } catch (\Throwable $e) {
-            return $this->deny('会话无效', 401);
-        }
-        if (($claims->realm ?? 'admin') !== 'admin') {
-            return $this->deny('非法领域', 403);
-        }
-        $adminId = (int)($claims->user_id ?? 0);
-        if ($adminId <= 0) {
-            return $this->deny('会话异常', 401);
+        // 1) 优先复用 AdminTokenMiddleware 注入的 claims；若没有就自行解析
+        $claims  = null;
+        $adminId = null;
+
+        if (app()->has('admin.jwt_claims') && app()->has('admin.id')) {
+            $claims  = app()->get('admin.jwt_claims');
+            $adminId = (int)app()->get('admin.id');
+        } else {
+            $auth = (string)($request->header('Authorization') ?? '');
+            $raw  = (stripos($auth, 'Bearer ') === 0) ? substr($auth, 7) : '';
+            if ($raw === '') {
+                return $this->deny('未登录', 401);
+            }
+            try {
+                $claims = $this->tokenService->parse($raw);
+            } catch (\Throwable $e) {
+                return $this->deny('会话无效', 401);
+            }
+            if (($claims->realm ?? 'admin') !== 'admin') {
+                return $this->deny('非法领域', 403);
+            }
+            $adminId = (int)($claims->user_id ?? 0);
+            if ($adminId <= 0) {
+                return $this->deny('会话异常', 401);
+            }
+            // 也注入容器，方便后续链路使用
+            app()->instance('admin.jwt_claims', $claims);
+            app()->instance('admin.id', $adminId);
         }
 
         // 2) 超管直通
@@ -88,20 +96,22 @@ class AdminPermissionMiddleware
         $required = array_values(array_filter(array_map('strval', $requiredCodes)));
         if (empty($required)) {
             if (!$enforceAll) {
-                // 未开启全局强制，且没传 codes：直接放行（兼容旧路由）
+                // 未开启强制 & 路由未显式声明：直接放行（兼容老路由）
                 return $next($request);
             }
-            $auto = $this->calcPermissionCode($request); // 例：admin.role.create
+            $auto = $this->calcPermissionCode($request); // 例：admin/permission/create → admin.permission.create 或 permission.create
+            $codePrefix = (string)(\app\common\Helper::getValue('permission.auto_code_prefix') ?? '');
+            $auto = $codePrefix . ltrim($auto, $codePrefix); // 如果已存在前缀，则不重复添加
             if (in_array($auto, $allowRoutes, true)) {
                 return $next($request);
             }
             $required = [$auto];
         }
 
-        // 4) 这些权限码必须在权限表中存在（避免路由写错/未配置）
+        // 4) 校验这些权限码是否都存在（避免路由/配置写错）
         $invalid = $this->nonexistentPermCodes($required);
         if (!empty($invalid)) {
-            if ((bool)(config('permission.auto_register_missing') ?? false)) {
+            if ((bool)(\app\common\Helper::getValue('permission.auto_register_missing') ?? false)) {
                 // （如需：可开启自动注册缺失的权限；建议上线环境关闭）
                 // foreach ($invalid as $code) {
                 //     AdminPermission::create([
@@ -123,13 +133,13 @@ class AdminPermissionMiddleware
             }
         }
 
-        // 5) 从缓存（或回源）获取当前管理员的权限集合
-        [$permSet, $cacheHit] = $this->loadAdminPermSet($adminId);
+        // 5) 读取当前管理员的权限集合（缓存 → 回源）
+        [$permSet, $cacheHit] = $this->loadAdminPermSet($adminId, $prefix);
 
-        // 6) ALL 模式：必须全部具备；若缓存命中仍缺，则强刷再校验一次（避免边界失效）
+        // 6) ALL 模式：必须全部具备；若缓存命中仍缺，则强刷一次再校验
         $missing = array_values(array_diff($required, $permSet));
         if (!empty($missing) && $cacheHit) {
-            [$permSet] = $this->loadAdminPermSet($adminId, true); // 强制刷新
+            [$permSet] = $this->loadAdminPermSet($adminId, $prefix, true);
             $missing = array_values(array_diff($required, $permSet));
         }
         if (!empty($missing)) {
@@ -191,15 +201,10 @@ class AdminPermissionMiddleware
     /**
      * 读取管理员权限集合
      * 返回 [codes[], 是否命中缓存]
-     *
-     * 策略：
-     *  - 先尝试直接读缓存（key 规则与 PermissionCacheService 一致：permission.prefix + adminId）
-     *  - 未命中则调用 PermissionCacheService::getAdminPermCodes() 回源（内部会 remember 到缓存）
-     *  - forceRefresh=true 时，先删除缓存再回源
      */
-    private function loadAdminPermSet(int $adminId, bool $forceRefresh = false): array
+    private function loadAdminPermSet(int $adminId, string $prefix, bool $forceRefresh = false): array
     {
-        $key = (string)(config('permission.prefix') ?? 'admin:perms:') . $adminId;
+        $key = $prefix . $adminId;
 
         if ($forceRefresh) {
             Cache::delete($key);

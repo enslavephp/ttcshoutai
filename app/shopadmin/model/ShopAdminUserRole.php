@@ -12,7 +12,7 @@ use think\facade\Db;
  * 建议表结构唯一索引：
  *   UNIQUE KEY uk_user_role_tenant (merchant_id, admin_id, role_id)
  *
- * 字段示例：
+ * 参考字段（根据你的库为准）：
  *  - id, merchant_id, admin_id, role_id
  *  - assigned_at, assigned_by
  *  - valid_from, valid_to
@@ -23,7 +23,7 @@ class ShopAdminUserRole extends Model
     /** 物理表名（受前缀管理） */
     protected $name = 'shopadmin_user_role';
 
-    /** 主键字段 */
+    /** 主键字段（若你的表无 id，可将 $pk=null 并把 $autoWriteTimestamp=false） */
     protected $pk   = 'id';
 
     /** 自动时间戳（若表无 created_at/updated_at，改为 false） */
@@ -60,16 +60,19 @@ class ShopAdminUserRole extends Model
         'updated_at'  => 'datetime',
     ];
 
-    /* ==================== 查询作用域 ==================== */
+    /* ==================== 查询作用域（含兼容命名） ==================== */
 
     /** 按商户 */
     public function scopeMerchantId($q, int $merchantId) { $q->where('merchant_id', $merchantId); }
+    public function scopeMerchant($q, int $merchantId)   { return $this->scopeMerchantId($q, $merchantId); } // 兼容
 
     /** 按用户 */
     public function scopeAdminId($q, int $adminId) { $q->where('admin_id', $adminId); }
+    public function scopeAdmin($q, int $adminId)   { return $this->scopeAdminId($q, $adminId); } // 兼容
 
     /** 按角色 */
-    public function scopeRoleId($q, int $roleId)   { $q->where('role_id',  $roleId); }
+    public function scopeRoleId($q, int $roleId) { $q->where('role_id',  $roleId); }
+    public function scopeRole($q, int $roleId)   { return $this->scopeRoleId($q, $roleId); } // 兼容
 
     /* ==================== 便捷查询 ==================== */
 

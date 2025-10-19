@@ -18,16 +18,16 @@ use app\shopadmin\service\ShopAdminSensitiveOperationService;
  *
  * 流程：
  *  1) 首次调用未携带确认 token：
- *       - 从配置读取 TTL（security.sensitive_ttl 或 security.sensitive_ttl_shopadmin，默认 300s）
- *       - 创建 pending_token，返回 HTTP 409（Conflict），告知 token 和有效期
+ *       - 读取 TTL（security.sensitive_ttl 或 security.sensitive_ttl_shopadmin，默认 300s）
+ *       - 生成 pending_token，返回 HTTP 409（Conflict）
  *       - 前端去调用 /shopadmin/secure/confirm/verify 完成确认
  *  2) 再次调用目标接口，并在 Header 中携带：
  *       X-Confirm-Token: <pending_token>
  *     （或使用参数 confirmation_token 传入）
  *
  * 说明：
- *  - 强制要求 JWT 为 realm=shopadmin，并且携带 merchant_id、user_id。
- *  - 兼容旧版 Service 签名（不含 merchant_id）。若你已升级 Service 为租户化签名，优先使用新签名。
+ *  - 强制要求 JWT 为 realm=shopadmin，并携带 merchant_id、user_id。
+ *  - 兼容旧版 Service 签名（不含 merchant_id）。如已升级为租户化签名，优先使用新签名。
  */
 class ShopAdminSensitiveOperationMiddleware
 {
@@ -36,12 +36,15 @@ class ShopAdminSensitiveOperationMiddleware
 
     public function __construct()
     {
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
         $this->tokenService = new TokenService(
             new CacheFacadeAdapter(),
             new SystemClock(),
-            config('jwt') ?: []
+            $jwtCfg
         );
-        $this->svc = new ShopAdminSensitiveOperationService();
     }
 
     /**
@@ -54,7 +57,7 @@ class ShopAdminSensitiveOperationMiddleware
         // 1) 解析 shopadmin access
         $auth = Request::header('Authorization') ?: '';
         $raw  = (stripos($auth, 'Bearer ') === 0) ? substr($auth, 7) : '';
-        if (!$raw) {
+        if ($raw === '') {
             return $this->jsonError('未登录', 401);
         }
 
@@ -77,8 +80,8 @@ class ShopAdminSensitiveOperationMiddleware
         $token = (string)(Request::header('X-Confirm-Token') ?? Request::param('confirmation_token', ''));
         if ($token === '') {
             // 未提供 token：生成待确认 token，返回 409
-            $ttl = (int)(config('security.sensitive_ttl_shopadmin')
-                ?? config('security.sensitive_ttl')
+            $ttl = (int)(\app\common\Helper::getValue('security.sensitive_ttl_shopadmin')
+                ?? \app\common\Helper::getValue('security.sensitive_ttl')
                 ?? 300);
 
             $opData = [
@@ -86,7 +89,7 @@ class ShopAdminSensitiveOperationMiddleware
                 'path'        => Request::baseUrl(),
                 'method'      => Request::method(),
                 'ip'          => Request::ip(),
-                'ua'          => substr(Request::server('HTTP_USER_AGENT') ?? '', 0, 180),
+                'ua'          => substr((string)(Request::server('HTTP_USER_AGENT') ?? ''), 0, 180),
                 'confirmed'   => false,
             ];
 
@@ -99,7 +102,7 @@ class ShopAdminSensitiveOperationMiddleware
                 $pending = $this->svc->initiate($adminId, $operationType, $opData, $ttl);
             }
 
-            return response()->data([
+            return json([
                 'msg'    => '需要二次确认',
                 'code'   => 409,
                 'status' => 'error',
@@ -109,7 +112,7 @@ class ShopAdminSensitiveOperationMiddleware
                     'expires_in'     => $ttl,
                     'how_to'         => '请先调用 /shopadmin/secure/confirm/verify 完成确认，再在 Header 中携带 X-Confirm-Token 重试本操作',
                 ],
-            ])->code(409);
+            ], 409);
         }
 
         // 3) 校验 token 是否已确认且未过期（同样兼容新旧签名）
@@ -130,6 +133,11 @@ class ShopAdminSensitiveOperationMiddleware
 
     private function jsonError(string $msg, int $code)
     {
-        return response()->data(['msg' => $msg, 'code' => $code, 'status' => 'error', 'data' => null])->code($code);
+        return json([
+            'msg'    => $msg,
+            'code'   => $code,
+            'status' => 'error',
+            'data'   => null,
+        ], $code);
     }
 }

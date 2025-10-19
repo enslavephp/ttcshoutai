@@ -30,10 +30,15 @@ class Permission extends BaseController
     // 构造函数，初始化 TokenService
     public function __construct()
     {
-        $cache = new CacheFacadeAdapter(); // 缓存适配器
-        $clock = new SystemClock(); // 系统时钟
-        $cfg = config('jwt') ?: []; // 获取配置文件中的 jwt 配置
-        $this->tokenService = new TokenService($cache, $clock, $cfg); // 初始化 TokenService
+        // 初始化 TokenService 用于生成和验证 JWT token
+        $jwtSecret = (string)(\app\common\Helper::getValue('jwt.secret') ?? 'PLEASE_CHANGE_ME');
+        $jwtCfg['secret'] = $jwtSecret;
+
+        $this->tokenService = new TokenService(
+            new CacheFacadeAdapter(),
+            new SystemClock(),
+            $jwtCfg
+        );
     }
 
     /** 去掉首尾 ASCII/全角空格（U+3000） */
@@ -46,7 +51,7 @@ class Permission extends BaseController
     /** 统一读取权限缓存前缀 */
     private function permCachePrefix(): string
     {
-        return (string)(config('permission.prefix') ?? 'admin:perms:'); // 获取权限缓存前缀
+        return (string)(\app\common\Helper::getValue('permission.prefix') ?? 'admin:perms:'); // 获取权限缓存前缀
     }
 
     /** 失效所有“通过角色持有该权限”的管理员的权限缓存 */
@@ -258,13 +263,28 @@ class Permission extends BaseController
         $page   = max(1, (int)(Request::post('page') ?? Request::get('page') ?? 1)); // 页码
         $limit  = min(100, max(1, (int)(Request::post('limit') ?? Request::get('limit') ?? 20))); // 每页限制
         $kw     = trim((string)(Request::post('keyword') ?? Request::get('keyword') ?? '')); // 关键字
-        $rtype  = trim((string)(Request::post('resource_type') ?? Request::get('resource_type') ?? '')); // 资源类型
-        $action = trim((string)(Request::post('action') ?? Request::get('action') ?? '')); // 动作
+        $role_id = trim((string)(Request::post('role_id') ?? Request::get('role_id') ?? '')); // 角色id
+        $bound  = trim((string)(Request::post('bound') ?? Request::get('bound') ?? '')); // 是否绑定了选中的角色
 
-        $query = AdminPermission::keyword($kw)   // 使用 keyword 范围
-        ->resourceType($rtype)                // 使用 resource_type 范围
-        ->resourceId($rtype)                  // 使用 resource_id 范围
-        ->action($action);                    // 使用 action 范围
+        // 默认查询对象
+        $query = AdminPermission::alias('p')->keyword($kw);
+
+        // 当有角色ID时才处理绑定关系
+        if (!empty($role_id)) {
+            // 默认绑定状态为1（已绑定）
+            $bound = $bound === '' ? '1' : $bound;
+
+            // 子查询：获取该角色已绑定的权限ID
+            $subQuery = AdminRolePermission::where('role_id', $role_id)
+                ->column('permission_id');
+            if ($bound === '1') {
+                // 查询已绑定的权限
+                $query = $query->whereIn('p.id', $subQuery);
+            } else {
+                // 查询未绑定的权限
+                $query = $query->whereNotIn('p.id', $subQuery);
+            }
+        }
 
         $total = $query->count(); // 获取总数
         $rows  = $query->pageAndSort($page, $limit, 'id', 'desc')->select()->toArray(); // 分页查询
@@ -274,7 +294,7 @@ class Permission extends BaseController
             'total' => $total,
             'page'  => $page,
             'limit' => $limit,
-        ]); // 返回分页结果
+        ]);
     }
 
 }

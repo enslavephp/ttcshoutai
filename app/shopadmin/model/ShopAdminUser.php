@@ -4,6 +4,8 @@ declare(strict_types=1);
 namespace app\shopadmin\model;
 
 use think\Model;
+use app\shopadmin\model\ShopAdminUserRole;
+use app\shopadmin\model\ShopAdminRole;
 
 /**
  * 【商户侧】管理员模型（ORM）
@@ -62,7 +64,6 @@ class ShopAdminUser extends Model
 
     /**
      * 多对多：用户 ⇄ 角色（返回中间表字段）
-     * 说明：这里不强依赖 wherePivot，租户隔离在 activeRoleIds() 等方法里保证。
      */
     public function roles()
     {
@@ -88,7 +89,7 @@ class ShopAdminUser extends Model
         $mid = (int)$this->getAttr('merchant_id');
 
         $rows = ShopAdminUserRole::alias('ur')
-            ->join(['shopadmin_role'=>'r'],'r.id = ur.role_id')
+            ->join(['shopadmin_role' => 'r'], 'r.id = ur.role_id')
             ->where('ur.admin_id', $uid)
             ->where('ur.merchant_id', $mid)
             ->where('r.merchant_id', $mid)
@@ -96,12 +97,12 @@ class ShopAdminUser extends Model
             ->where(function($q) use ($now){ $q->whereNull('ur.valid_from')->whereOr('ur.valid_from','<=',$now); })
             ->where(function($q) use ($now){ $q->whereNull('ur.valid_to')->whereOr('ur.valid_to','>',$now); })
             // 角色启停 + 有效期
-            ->where('r.status',1)
+            ->where('r.status', 1)
             ->where(function($q) use ($now){ $q->whereNull('r.valid_from')->whereOr('r.valid_from','<=',$now); })
             ->where(function($q) use ($now){ $q->whereNull('r.valid_to')->whereOr('r.valid_to','>',$now); })
             ->column('r.id');
 
-        return array_map('intval',$rows);
+        return array_map('intval', $rows);
     }
 
     /**
@@ -113,18 +114,18 @@ class ShopAdminUser extends Model
     public function bestRoleLevel(): int
     {
         $ids   = $this->activeRoleIds();
-        $order = (string)(config('permission.level_order') ?? 'asc');
-        if (!$ids) return $order==='desc' ? 0 : 99;
+        $order = (string) (\app\common\Helper::getValue('permission.level_order') ?? 'asc');
+        if (!$ids) return $order === 'desc' ? 0 : 99;
 
         $mid = (int)$this->getAttr('merchant_id');
 
-        $levels = ShopAdminRole::whereIn('id',$ids)
-            ->where('merchant_id',$mid)
+        $levels = ShopAdminRole::whereIn('id', $ids)
+            ->where('merchant_id', $mid)
             ->column('level');
 
-        if (!$levels) return $order==='desc' ? 0 : 99;
+        if (!$levels) return $order === 'desc' ? 0 : 99;
 
-        $levels = array_map('intval',$levels);
+        $levels = array_map('intval', $levels);
         return $order === 'desc' ? (int)max($levels) : (int)min($levels);
     }
 
@@ -136,7 +137,7 @@ class ShopAdminUser extends Model
 
     // ---------------- 便捷方法（自动传入 merchant_id） ----------------
 
-    public function attachRole(int $roleId, ?string $from=null, ?string $to=null, ?int $by=null): bool
+    public function attachRole(int $roleId, ?string $from = null, ?string $to = null, ?int $by = null): bool
     {
         $uid = (int)$this->getAttr('id');
         $mid = (int)$this->getAttr('merchant_id');
@@ -150,7 +151,7 @@ class ShopAdminUser extends Model
         return ShopAdminUserRole::detach($mid, $uid, $roleId);
     }
 
-    public function syncRoles(array $roleIds, ?int $by=null): bool
+    public function syncRoles(array $roleIds, ?int $by = null): bool
     {
         $uid = (int)$this->getAttr('id');
         $mid = (int)$this->getAttr('merchant_id');
